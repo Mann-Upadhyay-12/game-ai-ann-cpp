@@ -602,12 +602,13 @@ class Game {
     bool  ai_mode      = true;
 
     // Epsilon for exploration
-    float epsilon = 0.5f;
+    float epsilon = 0.25f;
     static constexpr float EPS_MIN  = 0.04f;
-    static constexpr float EPS_DECAY= 0.99995f;
+    static constexpr float EPS_DECAY= 0.999f;
 
     int   train_every = 64;  // steps between training
     int   step_count  = 0;
+    int   edge_timer  = 0;   // track edge camping
 
     // Nearest-bullet distance last frame (for dodge reward)
     float prev_min_b_dist = 1e9f;
@@ -664,6 +665,10 @@ public:
     }
 
 private:
+    bool is_visible(Vector2 p) const {
+        return (p.x >= 0 && p.x <= WIDTH && p.y >= 0 && p.y <= HEIGHT);
+    }
+
     // ── State Vector (16 features) ──────────────
     Vec get_state() const {
         Vec s;
@@ -674,41 +679,59 @@ private:
         s.push_back(player->get_vel().x / 8.f);
         s.push_back(player->get_vel().y / 8.f);
 
-        // Nearest enemy: relative direction + distance + velocity
+        // Nearest visible enemy: relative direction + distance + velocity
         float  min_ed = 1e9f;
         Vector2 near_e = {0,0};
         Enemy*  near_ep = nullptr;
+        bool found_enemy = false;
+
         for (auto* e : enemies) {
+            if (!is_visible(e->get_pos())) continue;
             float d = player->get_pos().distance_to(e->get_pos());
-            if (d < min_ed) { min_ed = d; near_e = e->get_pos(); near_ep = e; }
+            if (d < min_ed) { min_ed = d; near_e = e->get_pos(); near_ep = e; found_enemy = true; }
         }
-        Vector2 e_rel_dir = (near_e - player->get_pos()).normalize();
-        s.push_back(e_rel_dir.x);
-        s.push_back(e_rel_dir.y);
-        s.push_back(std::min(1.f, min_ed / 900.f));   // normalised distance
 
-        // Enemy velocity (for predictive aim)
-        Vector2 ev = near_ep ? near_ep->get_vel_smooth() : Vector2{0,0};
-        s.push_back(ev.x / 5.f);
-        s.push_back(ev.y / 5.f);
+        if (found_enemy) {
+            Vector2 e_rel_dir = (near_e - player->get_pos()).normalize();
+            s.push_back(e_rel_dir.x);
+            s.push_back(e_rel_dir.y);
+            s.push_back(std::min(1.f, min_ed / 900.f));   // normalised distance
+            // Enemy velocity (for predictive aim)
+            Vector2 ev = near_ep->get_vel_smooth();
+            s.push_back(ev.x / 5.f);
+            s.push_back(ev.y / 5.f);
+        } else {
+            s.push_back(0.f); s.push_back(0.f); // dir
+            s.push_back(1.f);                   // max dist
+            s.push_back(0.f); s.push_back(0.f); // vel
+        }
 
-        // Nearest enemy bullet: direction + distance
+        // Nearest visible enemy bullet: direction + distance
         float  min_bd = 1e9f;
         Vector2 near_b = {0,0};
         Vector2 near_bv= {0,0};
-        for (auto* b : e_bullets) {
-            float d = player->get_pos().distance_to(b->get_pos());
-            if (d < min_bd) { min_bd = d; near_b = b->get_pos(); near_bv = b->get_vel(); }
-        }
-        Vector2 b_dir = (near_b - player->get_pos()).normalize();
-        s.push_back(b_dir.x);
-        s.push_back(b_dir.y);
-        s.push_back(std::min(1.f, min_bd / 500.f));
+        bool found_bullet = false;
 
-        // Incoming bullet velocity direction (is it heading toward player?)
-        Vector2 b_vel_n = near_bv.normalize();
-        s.push_back(b_vel_n.x);
-        s.push_back(b_vel_n.y);
+        for (auto* b : e_bullets) {
+            if (!is_visible(b->get_pos())) continue;
+            float d = player->get_pos().distance_to(b->get_pos());
+            if (d < min_bd) { min_bd = d; near_b = b->get_pos(); near_bv = b->get_vel(); found_bullet = true; }
+        }
+
+        if (found_bullet) {
+            Vector2 b_dir = (near_b - player->get_pos()).normalize();
+            s.push_back(b_dir.x);
+            s.push_back(b_dir.y);
+            s.push_back(std::min(1.f, min_bd / 500.f));
+            // Incoming bullet velocity direction (is it heading toward player?)
+            Vector2 b_vel_n = near_bv.normalize();
+            s.push_back(b_vel_n.x);
+            s.push_back(b_vel_n.y);
+        } else {
+            s.push_back(0.f); s.push_back(0.f); // dir
+            s.push_back(1.f);                   // max dist
+            s.push_back(0.f); s.push_back(0.f); // vel dir
+        }
 
         // Shoot cooldown readiness
         s.push_back(1.f - player->get_cd() / 10.f);
@@ -823,62 +846,93 @@ private:
         Vector2 move_dir = {act[MOVE_X], act[MOVE_Y]};
         player->move(move_dir, ai_mode);
 
-        // ── Reward ──
-        float reward = 0.03f; // survival tick
-
-        // Center preference (softer)
+        // ── Reward Calculation ──
+        float reward = 0.03f + (step_count % 10000) * 0.00001f; // scaling survival bonus
         Vector2 p_pos = player->get_pos();
-        float center_d = p_pos.distance_to({WIDTH/2.f, HEIGHT/2.f});
-        reward -= center_d * 0.00008f;
 
-        // Boundary penalty
+        // Soft center gravity (quadratic)
+        float center_d = p_pos.distance_to({WIDTH/2.f, HEIGHT/2.f});
+        float norm_cd  = center_d / 450.f;
+        reward -= norm_cd * norm_cd * 0.08f;
+
+        // Boundary penalty (hard)
         if (ai_mode) {
             int cx = WIDTH/2, cy = HEIGHT/2;
             if (p_pos.x < cx-290 || p_pos.x > cx+290 || p_pos.y < cy-290 || p_pos.y > cy+290)
                 reward -= 2.f;
         }
 
-        // Movement reward
-        if (move_dir.length() < 0.05f) reward -= 0.05f;
-        else reward += 0.01f;
+        // Edge stick penalty (time-based)
+        bool near_edge = (p_pos.x < 100 || p_pos.x > WIDTH-100 || p_pos.y < 100 || p_pos.y > HEIGHT-100);
+        if (near_edge) edge_timer++;
+        else           edge_timer = 0;
+        if (edge_timer > 60) reward -= 0.2f;
 
-        // ── Dodge reward ──
-        float min_bd = 1e9f;
-        Vector2 near_bp = {0,0}, near_bv = {0,0};
-        for (auto* b : e_bullets) {
-            float d = p_pos.distance_to(b->get_pos());
-            if (d < min_bd) { min_bd = d; near_bp = b->get_pos(); near_bv = b->get_vel(); }
+        // Re-detect nearest entities for rewards (now using vision)
+        float  min_ed = 1e9f, min_bd = 1e9f;
+        Vector2 near_ep = {0,0}, near_ev = {0,0}, near_bp = {0,0}, near_bv = {0,0};
+        bool found_enemy = false, found_bullet = false;
+        int nearby_bullets = 0;
+
+        for (auto* e : enemies) {
+            if (!is_visible(e->get_pos())) continue;
+            float d = p_pos.distance_to(e->get_pos());
+            if (d < min_ed) { min_ed = d; near_ep = e->get_pos(); near_ev = e->get_vel_smooth(); found_enemy = true; }
         }
-        if (min_bd < 250.f) {
-            // Reward increasing distance to bullet
+        for (auto* b : e_bullets) {
+            if (!is_visible(b->get_pos())) continue;
+            float d = p_pos.distance_to(b->get_pos());
+            if (d < 200.f) nearby_bullets++;
+            if (d < min_bd) { min_bd = d; near_bp = b->get_pos(); near_bv = b->get_vel(); found_bullet = true; }
+        }
+
+        // Multi-bullet awareness
+        reward -= nearby_bullets * 0.05f;
+
+        // Smart movement reward
+        float move_mag = move_dir.length();
+        if (move_mag < 0.05f) {
+            reward -= 0.15f; // standing still = illegal
+        } else {
+            // Reward dodging if bullet is near
+            if (found_bullet && min_bd < 250.f) {
+                Vector2 away = (p_pos - near_bp).normalize();
+                float smart_move = move_dir.normalize().dot(away);
+                reward += smart_move * 0.4f; // buffed dodge reward
+            } else {
+                reward += 0.05f; // moving = good
+            }
+        }
+
+        // Dodge trajectory reward & Panic Zone
+        if (found_bullet && min_bd < 250.f) {
+            if (min_bd < 120.f) reward -= 0.5f; // Panic Zone
             if (min_bd > prev_min_b_dist) reward += 0.25f;
-            // Reward moving perpendicular/away from bullet trajectory
-            Vector2 away  = (p_pos - near_bp).normalize();
             Vector2 bdir  = near_bv.normalize();
-            float   align = move_dir.normalize().dot(away);
-            float   oncoming = -move_dir.normalize().dot(bdir); // reward if moving opposite bullet
-            reward += align * 0.35f + oncoming * 0.15f;
+            float   oncoming = -move_dir.normalize().dot(bdir);
+            reward += oncoming * 0.3f; // buffed oncoming dodging
         }
         prev_min_b_dist = min_bd;
 
-        // ── Enemy distance penalty ──
-        bool has_enemy = !enemies.empty();
-        float min_ed   = 1e9f;
-        Vector2 near_ep= {0,0};
-        Vector2 near_ev= {0,0};
-        for (auto* e : enemies) {
-            float d = p_pos.distance_to(e->get_pos());
-            if (d < min_ed) { min_ed = d; near_ep = e->get_pos(); near_ev = e->get_vel_smooth(); }
+        // Enemy proximity penalty & engagement reward
+        if (found_enemy) {
+            if (min_ed < 110.f) reward -= 0.12f;
+            if (min_ed < 350.f) reward += 0.05f; // Engagement reward
         }
-        if (has_enemy && min_ed < 110.f) reward -= 0.12f;
+
+        // Accuracy reward
+        float acc = shots_fired > 0 ? (float)shots_hit / shots_fired : 0.f;
+        reward += acc * 0.5f;
 
         // ── Shoot ──
         if (act[SHOOT_PROB] > 0.5f && player->can_shoot()) {
-            if (has_enemy) {
-                reward += 0.15f; // reward for taking shot
-                if (step_count < 20000) reward += 0.2f; // early training spam encouragement
+            if (found_enemy) {
+                // Survival vs Shooting priority
+                if (found_bullet && min_bd < 180.f) reward -= 0.3f; // prioritize survival
 
-                reward -= 0.02f;  // ammo cost
+                // Softened encouragement
+                if (step_count < 20000) reward += 0.08f;
+                reward -= 0.1f; // Ammo cost
 
                 float b_speed = 10.f;
                 Vector2 aim_dir = {act[AIM_X], act[AIM_Y]};
@@ -888,23 +942,22 @@ private:
                     Vector2 pred_target = predict_aim(p_pos, near_ep, near_ev, b_speed);
                     Vector2 pred_dir    = (pred_target - p_pos).normalize();
 
-                    // Blend AI aim with prediction (60/40)
-                    if (aim_dir.length() > 0.1f) {
-                        aim_dir = (aim_dir.normalize() * 0.6f + pred_dir * 0.4f).normalize();
-                    } else {
+                    // Blend AI aim with prediction (60/40) for imperfection later 
+                    // if (aim_dir.length() > 0.1f) {
+                    //     aim_dir = (aim_dir.normalize() * 0.6f + pred_dir * 0.4f).normalize();
+                    // } else {
                         aim_dir = pred_dir;
-                    }
+                    // }
 
-                    // Aim quality reward — use angle to enemy (tighter = bigger reward)
+                    // Aim quality reward
                     Vector2 to_e  = (near_ep - p_pos).normalize();
-                    float   aq    = aim_dir.dot(to_e); // [-1, 1]
-                    if (aq > 0.90f) reward += 1.2f;      // near-perfect aim → big reward
-                    else if (aq > 0.7f) reward += 0.5f;
-                    else if (aq > 0.4f) reward += 0.1f;
-                    else reward -= 0.1f; // punish wild shots
+                    float   aq    = aim_dir.dot(to_e);
+if (aq > 0.95f)      reward += 2.5f;
+else if (aq > 0.85f) reward += 1.2f;
+else if (aq > 0.7f)  reward += 0.3f;
+else                 reward -= 0.8f;
 
-                    // Punish shooting at distant targets
-                    if (min_ed > 450.f) reward -= 0.4f;
+                    if (min_ed > 500.f) reward -= 0.3f;
 
                     Vector2 fire_target = p_pos + aim_dir * 1200.f;
                     p_bullets.push_back(new Bullet(p_pos, fire_target, {120,220,80,255}, 10, b_speed));
@@ -1003,7 +1056,11 @@ private:
         // Player bullets (near-miss shaping)
         for (auto bit = p_bullets.begin(); bit != p_bullets.end();) {
             (*bit)->update();
-            if (!(*bit)->is_alive()) { delete *bit; bit = p_bullets.erase(bit); }
+            if (!(*bit)->is_alive()) { 
+                reward -= 0.6f; // penalty for bullet dying without a hit
+                delete *bit; 
+                bit = p_bullets.erase(bit); 
+            }
             else ++bit;
         }
 
