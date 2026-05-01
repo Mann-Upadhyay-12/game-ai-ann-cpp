@@ -3,436 +3,654 @@
 #include <SDL2/SDL_ttf.h>
 #include <iostream>
 #include <vector>
+#include <deque>
 #include <cmath>
 #include <algorithm>
 #include <random>
+#include <fstream>
+#include <cstring>
+#include <numeric>
+#include <cassert>
 
+// ─────────────────────────────────────────────
 // Constants
-const int WIDTH = 1200;
+// ─────────────────────────────────────────────
+const int WIDTH  = 1600;
 const int HEIGHT = 900;
-const int CUBE_SIZE = 30;
 
-// Enums
-enum Action {
-    IDLE,
-    UP,
-    DOWN,
-    LEFT,
-    RIGHT,
-    SHOOT
-};
+// ─────────────────────────────────────────────
+// Action indices
+// ─────────────────────────────────────────────
+enum Action { MOVE_X = 0, MOVE_Y, AIM_X, AIM_Y, SHOOT_PROB, NUM_ACTIONS };
 
+// ─────────────────────────────────────────────
 // Math Utilities
-class Vector2 {
-public:
-    float x, y;
-
+// ─────────────────────────────────────────────
+struct Vector2 {
+    float x = 0, y = 0;
     Vector2(float x = 0, float y = 0) : x(x), y(y) {}
-
-    Vector2 operator+(const Vector2& v) const { return {x + v.x, y + v.y}; }
-    Vector2 operator-(const Vector2& v) const { return {x - v.x, y - v.y}; }
-    Vector2 operator*(float s) const { return {x * s, y * s}; }
-    Vector2 operator/(float s) const { return {x / s, y / s}; }
-    Vector2& operator+=(const Vector2& v) { x += v.x; y += v.y; return *this; }
-    
-    float length() const { return std::sqrt(x * x + y * y); }
-    
+    Vector2 operator+(const Vector2& v) const { return {x+v.x, y+v.y}; }
+    Vector2 operator-(const Vector2& v) const { return {x-v.x, y-v.y}; }
+    Vector2 operator*(float s)          const { return {x*s,   y*s};   }
+    Vector2 operator/(float s)          const { return {x/s,   y/s};   }
+    Vector2& operator+=(const Vector2& v){ x+=v.x; y+=v.y; return *this; }
+    Vector2& operator-=(const Vector2& v){ x-=v.x; y-=v.y; return *this; }
+    float length()   const { return std::sqrt(x*x + y*y); }
+    float dot(const Vector2& v) const { return x*v.x + y*v.y; }
     Vector2 normalize() const {
         float l = length();
-        if (l > 0) return {x / l, y / l};
-        return {0, 0};
+        return (l > 1e-6f) ? Vector2{x/l, y/l} : Vector2{0,0};
     }
-    
-    float distance_to(const Vector2& v) const {
-        return (*this - v).length();
+    float distance_to(const Vector2& v) const { return (*this - v).length(); }
+};
+
+// ─────────────────────────────────────────────
+// RNG helpers
+// ─────────────────────────────────────────────
+class RNG {
+    static std::mt19937& gen() {
+        static std::mt19937 g(std::random_device{}());
+        return g;
+    }
+public:
+    static float flt(float lo, float hi) {
+        return std::uniform_real_distribution<float>(lo, hi)(gen());
+    }
+    static int rng_int(int lo, int hi) {
+        return std::uniform_int_distribution<int>(lo, hi)(gen());
+    }
+    // Normal distribution sample
+    static float normal(float mean = 0.f, float std = 1.f) {
+        return std::normal_distribution<float>(mean, std)(gen());
     }
 };
 
-class Random {
-public:
-    static float get_float(float min, float max) {
-        static std::random_device rd;
-        static std::mt19937 gen(rd());
-        std::uniform_real_distribution<float> dis(min, max);
-        return dis(gen);
-    }
+// ─────────────────────────────────────────────
+// NN helper: linear algebra
+// ─────────────────────────────────────────────
+using Mat = std::vector<std::vector<float>>;
+using Vec = std::vector<float>;
 
-    static int get_int(int min, int max) {
-        static std::random_device rd;
-        static std::mt19937 gen(rd());
-        std::uniform_int_distribution<int> dis(min, max);
-        return dis(gen);
-    }
+static Mat make_mat(int rows, int cols, float val = 0.f) {
+    return Mat(rows, Vec(cols, val));
+}
+
+static Vec mat_vec_mul(const Mat& W, const Vec& x) {
+    Vec out(W.size(), 0.f);
+    for (int i = 0; i < (int)W.size(); i++)
+        for (int j = 0; j < (int)x.size(); j++)
+            out[i] += W[i][j] * x[j];
+    return out;
+}
+
+static void add_bias(Vec& v, const Vec& b) {
+    for (int i = 0; i < (int)v.size(); i++) v[i] += b[i];
+}
+
+static Vec leaky_relu(const Vec& v, float alpha = 0.01f) {
+    Vec out(v.size());
+    for (int i = 0; i < (int)v.size(); i++)
+        out[i] = v[i] >= 0.f ? v[i] : alpha * v[i];
+    return out;
+}
+
+static Vec d_leaky_relu(const Vec& pre, float alpha = 0.01f) {
+    Vec out(pre.size());
+    for (int i = 0; i < (int)pre.size(); i++)
+        out[i] = pre[i] >= 0.f ? 1.f : alpha;
+    return out;
+}
+
+// Layer Normalization (zero mean, unit variance per sample)
+static void layer_norm(Vec& v, float eps = 1e-5f) {
+    float mean = 0, var = 0;
+    for (float x : v) mean += x;
+    mean /= v.size();
+    for (float x : v) var += (x - mean) * (x - mean);
+    var /= v.size();
+    float inv = 1.f / std::sqrt(var + eps);
+    for (float& x : v) x = (x - mean) * inv;
+}
+
+// ─────────────────────────────────────────────
+// Adam optimizer state
+// ─────────────────────────────────────────────
+struct AdamState {
+    Mat m, v;   // first/second moment for weight matrix
+    Vec mb, vb; // for bias vector
+    int t = 0;
+
+    AdamState() = default;
+    AdamState(int rows, int cols)
+        : m(make_mat(rows, cols)), v(make_mat(rows, cols)),
+          mb(rows, 0.f), vb(rows, 0.f) {}
 };
 
-// Base Classes
-class Entity {
-protected:
-    Vector2 pos;
-    SDL_Rect rect;
-    SDL_Color color;
-    bool alive;
+static void adam_update(Mat& W, Vec& b,
+                        const Mat& dW, const Vec& db,
+                        AdamState& st,
+                        float lr, float beta1 = 0.9f, float beta2 = 0.999f, float eps = 1e-8f)
+{
+    st.t++;
+    float bc1 = 1.f - std::pow(beta1, st.t);
+    float bc2 = 1.f - std::pow(beta2, st.t);
 
-public:
-    Entity(Vector2 p, int w, int h, SDL_Color c) : pos(p), color(c), alive(true) {
-        rect = { 0, 0, w, h };
+    for (int i = 0; i < (int)W.size(); i++) {
+        for (int j = 0; j < (int)W[0].size(); j++) {
+            st.m[i][j] = beta1 * st.m[i][j] + (1.f-beta1) * dW[i][j];
+            st.v[i][j] = beta2 * st.v[i][j] + (1.f-beta2) * dW[i][j] * dW[i][j];
+            float mhat = st.m[i][j] / bc1;
+            float vhat = st.v[i][j] / bc2;
+            W[i][j] += lr * mhat / (std::sqrt(vhat) + eps);
+        }
+        st.mb[i] = beta1 * st.mb[i] + (1.f-beta1) * db[i];
+        st.vb[i] = beta2 * st.vb[i] + (1.f-beta2) * db[i] * db[i];
+        float mhat = st.mb[i] / bc1;
+        float vhat = st.vb[i] / bc2;
+        b[i] += lr * mhat / (std::sqrt(vhat) + eps);
     }
-    
-    virtual ~Entity() {}
+}
 
-    virtual void update() = 0;
-    
-    virtual void draw(SDL_Renderer* renderer, int ox, int oy) {
-        SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, color.a);
-        SDL_Rect r = { 
-            (int)std::round(pos.x - rect.w / 2) + ox, 
-            (int)std::round(pos.y - rect.h / 2) + oy, 
-            rect.w, 
-            rect.h 
+// ─────────────────────────────────────────────
+// Policy Network  (3-hidden-layer MLP)
+//   Input  : STATE_DIM
+//   Hidden : 128 → 128 → 64  (LeakyReLU + LayerNorm)
+//   Output : NUM_ACTIONS      (tanh for 0-3, sigmoid for 4)
+// ─────────────────────────────────────────────
+static constexpr int STATE_DIM  = 16; // expanded state
+static constexpr int H1 = 128, H2 = 128, H3 = 64;
+
+struct PolicyNet {
+    // Weights
+    Mat w1, w2, w3, w4;
+    Vec b1, b2, b3, b4;
+    // Adam states
+    AdamState as1, as2, as3, as4;
+    float lr = 3e-4f;
+
+    PolicyNet() {
+        auto he = [](int fan_in, int fan_out) {
+            float s = std::sqrt(2.f / fan_in);
+            return RNG::normal(0, s);
         };
-        SDL_RenderFillRect(renderer, &r);
+
+        auto init_mat = [&](Mat& W, Vec& b, int rows, int cols) {
+            W = make_mat(rows, cols);
+            b.assign(rows, 0.f);
+            for (auto& row : W) for (auto& w : row) w = he(cols, rows);
+        };
+
+        init_mat(w1, b1, H1, STATE_DIM);
+        init_mat(w2, b2, H2, H1);
+        init_mat(w3, b3, H3, H2);
+        init_mat(w4, b4, NUM_ACTIONS, H3);
+
+        // shoot bias: start near 0 to avoid random shooting
+        b4[SHOOT_PROB] = -1.f;
+
+        as1 = AdamState(H1, STATE_DIM);
+        as2 = AdamState(H2, H1);
+        as3 = AdamState(H3, H2);
+        as4 = AdamState(NUM_ACTIONS, H3);
     }
 
-    bool is_alive() const { return alive; }
-    void die() { alive = false; }
-    Vector2 get_pos() const { return pos; }
-    SDL_Rect get_rect() const {
-        return { (int)(pos.x - rect.w / 2), (int)(pos.y - rect.h / 2), rect.w, rect.h };
-    }
-};
+    struct Cache { Vec h1, h2, h3, pre1, pre2, pre3; };
 
-// Game Entities
-class Particle : public Entity {
-private:
-    Vector2 velocity;
-    int lifetime;
+    Vec forward(const Vec& s, Cache* cache = nullptr, bool training = false) const {
+        // Layer 1
+        Vec pre1 = mat_vec_mul(w1, s); add_bias(pre1, b1);
+        Vec h1   = leaky_relu(pre1);   layer_norm(h1);
 
-public:
-    Particle(Vector2 p, SDL_Color c) 
-        : Entity(p, 4, 4, c), 
-          velocity(Random::get_float(-3, 3), Random::get_float(-3, 3)), 
-          lifetime(30) {}
+        // Dropout (training only) — 20%
+        if (training) for (auto& v : h1) if (RNG::flt(0,1) < 0.15f) v = 0.f;
 
-    void update() override {
-        pos += velocity;
-        lifetime--;
-        if (lifetime <= 0) die();
-    }
-};
+        // Layer 2
+        Vec pre2 = mat_vec_mul(w2, h1); add_bias(pre2, b2);
+        Vec h2   = leaky_relu(pre2);    layer_norm(h2);
+        if (training) for (auto& v : h2) if (RNG::flt(0,1) < 0.15f) v = 0.f;
 
-class Bullet : public Entity {
-private:
-    Vector2 velocity;
+        // Layer 3
+        Vec pre3 = mat_vec_mul(w3, h2); add_bias(pre3, b3);
+        Vec h3   = leaky_relu(pre3);    layer_norm(h3);
 
-public:
-    Bullet(Vector2 p, Vector2 target, SDL_Color c, int size, float speed) 
-        : Entity(p, size, size, c) {
-        Vector2 dir = target - p;
-        if (dir.length() > 0) velocity = dir.normalize() * speed;
-        else velocity = { speed, 0 };
-    }
+        // Output
+        Vec out = mat_vec_mul(w4, h3); add_bias(out, b4);
 
-    void update() override {
-        pos += velocity;
-        if (pos.x < 0 || pos.x > WIDTH || pos.y < 0 || pos.y > HEIGHT) die();
-    }
-};
+        // Activations
+        for (int i = 0; i < 4; i++) out[i] = std::tanh(out[i]);
+        out[SHOOT_PROB] = 1.f / (1.f + std::exp(-out[SHOOT_PROB]));
 
-class Player : public Entity {
-private:
-    Vector2 velocity;
-    int health;
-    int shoot_timeout;
-    float speed;
-
-public:
-    Player() 
-        : Entity({ WIDTH / 2, HEIGHT / 2 }, 30, 30, { 255, 255, 255, 255 }), 
-          health(100), shoot_timeout(0), speed(4.0f) {}
-
-    void update() override {
-        if (shoot_timeout > 0) shoot_timeout--;
-    }
-
-    void move(Vector2 move_vector) {
-        if (move_vector.length() > 0) {
-            velocity = move_vector.normalize() * speed;
-            pos += velocity;
-            clamp_position();
-        } else {
-            velocity = { 0, 0 };
-        }
-    }
-
-    void clamp_position() {
-        if (pos.x < rect.w / 2) pos.x = rect.w / 2;
-        if (pos.x > WIDTH - rect.w / 2) pos.x = WIDTH - rect.w / 2;
-        if (pos.y < rect.h / 2) pos.y = rect.h / 2;
-        if (pos.y > HEIGHT - rect.h / 2) pos.y = HEIGHT - rect.h / 2;
-    }
-
-    bool can_shoot() const { return shoot_timeout == 0; }
-    void reset_shoot_timeout() { shoot_timeout = 10; }
-    void take_damage(int amount) { health -= amount; }
-    int get_health() const { return health; }
-    Vector2 get_velocity() const { return velocity; }
-};
-
-class Enemy : public Entity {
-private:
-    Player* player_ptr;
-    float dist;
-    float angle;
-    float spiral_speed;
-    float approach_speed;
-    float min_dist;
-    int health;
-    int shoot_timeout;
-    std::vector<Bullet*>& bullets_ref;
-
-public:
-    Enemy(Player* p, std::vector<Bullet*>& bullets) 
-        : Entity({0, 0}, 25, 25, { 255, 50, 50, 255 }), 
-          player_ptr(p), 
-          approach_speed(1.0f), min_dist(150.0f), 
-          health(100), 
-          bullets_ref(bullets) {
-        
-        spawn_at_edge();
-        Vector2 rel = pos - player_ptr->get_pos();
-        dist = rel.length();
-        angle = std::atan2(rel.y, rel.x);
-        spiral_speed = (Random::get_float(1, 5) * (Random::get_int(0, 1) ? 1 : -1)) / 100.0f;
-        shoot_timeout = Random::get_int(60, 120);
-    }
-
-    void spawn_at_edge() {
-        int side = Random::get_int(0, 3);
-        if (side == 0) pos = { Random::get_float(0, WIDTH), -30 };
-        else if (side == 1) pos = { WIDTH + 30, Random::get_float(0, HEIGHT) };
-        else if (side == 2) pos = { Random::get_float(0, WIDTH), HEIGHT + 30 };
-        else pos = { -30, Random::get_float(0, HEIGHT) };
-    }
-
-    void update() override {
-        angle += spiral_speed;
-        if (dist > min_dist) dist -= approach_speed;
-        Vector2 offset = { std::cos(angle) * dist, std::sin(angle) * dist };
-        pos = player_ptr->get_pos() + offset;
-
-        if (--shoot_timeout <= 0) {
-            shoot();
-            shoot_timeout = Random::get_int(90, 180);
-        }
-    }
-
-    void shoot() {
-        float b_speed = 5.0f;
-        float dist_to_p = pos.distance_to(player_ptr->get_pos());
-        float time_to_reach = dist_to_p / b_speed;
-        Vector2 predicted_pos = player_ptr->get_pos() + (player_ptr->get_velocity() * time_to_reach);
-        bullets_ref.push_back(new Bullet(pos, predicted_pos, { 255, 100, 100, 255 }, 8, b_speed));
-    }
-
-    void take_damage(int amount) {
-        health -= amount;
-        if (health <= 0) die();
-    }
-};
-
-class Background {
-private:
-    SDL_Texture* texture;
-    int width, height;
-    float moved;
-
-public:
-    Background(SDL_Renderer* renderer) : texture(nullptr), width(0), height(0), moved(0) {
-        texture = IMG_LoadTexture(renderer, "back.jpg");
-        if (texture) SDL_QueryTexture(texture, NULL, NULL, &width, &height);
-    }
-
-    ~Background() {
-        if (texture) SDL_DestroyTexture(texture);
-    }
-
-    void update() {
-        moved += 1.0f;
-        if (moved >= width) moved = 0;
-    }
-
-    void draw(SDL_Renderer* renderer, int ox, int oy) {
-        if (!texture) return;
-        SDL_Rect r1 = { (int)(-moved) + ox, oy, width, HEIGHT };
-        SDL_Rect r2 = { (int)(width - moved) + ox, oy, width, HEIGHT };
-        SDL_RenderCopy(renderer, texture, NULL, &r1);
-        SDL_RenderCopy(renderer, texture, NULL, &r2);
-    }
-};
-
-class Model {
-public:
-    int input_size;
-    int hidden_size;
-    int output_size;
-    
-    std::vector<std::vector<float>> w1; // input to hidden
-    std::vector<std::vector<float>> w2; // hidden to output
-    float lr = 0.01f;
-
-    struct Experience {
-        std::vector<float> state;
-        int action;
-        float reward;
-        std::vector<float> probs;
-    };
-    std::vector<Experience> memory;
-
-    Model(int in, int out) : input_size(in), hidden_size(16), output_size(out) {
-        w1.resize(hidden_size, std::vector<float>(input_size));
-        w2.resize(output_size, std::vector<float>(hidden_size));
-        
-        for (auto& row : w1) for (auto& w : row) w = Random::get_float(-0.5, 0.5);
-        for (auto& row : w2) for (auto& w : row) w = Random::get_float(-0.5, 0.5);
-    }
-
-    std::vector<float> softmax(const std::vector<float>& x) {
-        std::vector<float> out(x.size());
-        float maxv = *std::max_element(x.begin(), x.end());
-        float sum = 0;
-        for (size_t i = 0; i < x.size(); i++) {
-            out[i] = std::exp(x[i] - maxv);
-            sum += out[i];
-        }
-        for (float& v : out) v /= sum;
+        if (cache) *cache = {h1, h2, h3, pre1, pre2, pre3};
         return out;
     }
 
-    std::vector<float> forward_probs(const std::vector<float>& state) {
-        std::vector<float> h(hidden_size);
-        // hidden layer
-        for (int i = 0; i < hidden_size; i++) {
-            float sum = 0;
-            for (int j = 0; j < input_size; j++)
-                sum += w1[i][j] * state[j];
-            h[i] = std::tanh(sum);
-        }
-
-        // output layer
-        std::vector<float> logits(output_size);
-        for (int i = 0; i < output_size; i++) {
-            float sum = 0;
-            for (int j = 0; j < hidden_size; j++)
-                sum += w2[i][j] * h[j];
-            logits[i] = sum;
-        }
-        return softmax(logits);
+    // Full forward for training (returns activations without dropout applied to final pass)
+    Vec forward_train(const Vec& s, Cache& cache) {
+        Vec pre1 = mat_vec_mul(w1, s); add_bias(pre1, b1);
+        Vec h1   = leaky_relu(pre1);   layer_norm(h1);
+        Vec pre2 = mat_vec_mul(w2, h1); add_bias(pre2, b2);
+        Vec h2   = leaky_relu(pre2);    layer_norm(h2);
+        Vec pre3 = mat_vec_mul(w3, h2); add_bias(pre3, b3);
+        Vec h3   = leaky_relu(pre3);    layer_norm(h3);
+        Vec out  = mat_vec_mul(w4, h3); add_bias(out, b4);
+        for (int i = 0; i < 4; i++) out[i] = std::tanh(out[i]);
+        out[SHOOT_PROB] = 1.f / (1.f + std::exp(-out[SHOOT_PROB]));
+        cache = {h1, h2, h3, pre1, pre2, pre3};
+        return out;
     }
 
-    int sample_action(const std::vector<float>& probs) {
-        float r = Random::get_float(0, 1);
-        float cum = 0;
-        for (int i = 0; i < (int)probs.size(); i++) {
-            cum += probs[i];
-            if (r < cum) return i;
-        }
-        return (int)probs.size() - 1;
-    }
+    void train_batch(const std::vector<Vec>& states,
+                     const std::vector<Vec>& outputs_taken,
+                     const std::vector<float>& returns)
+    {
+        int N = (int)states.size();
 
-    void remember(std::vector<float> s, int a, float r, std::vector<float> p) {
-        memory.push_back({s, a, r, p});
-    }
+        // Normalize returns
+        float mean_r = 0, std_r = 0;
+        for (float r : returns) mean_r += r;
+        mean_r /= N;
+        for (float r : returns) std_r += (r - mean_r) * (r - mean_r);
+        std_r = std::sqrt(std_r / N + 1e-8f);
 
-    void train() {
-        if (memory.empty()) return;
-        
-        float gamma = 0.99f;
-        float G = 0;
-        float total_r = 0;
-        for (auto& m : memory) total_r += m.reward;
-        std::cout << "Training Policy Gradient... Avg Reward/Step: " << (total_r / (float)memory.size()) << std::endl;
+        // Accumulate gradients
+        Mat dw1 = make_mat(H1, STATE_DIM), dw2 = make_mat(H2, H1),
+            dw3 = make_mat(H3, H2),       dw4 = make_mat(NUM_ACTIONS, H3);
+        Vec db1(H1,0), db2(H2,0), db3(H3,0), db4(NUM_ACTIONS,0);
 
-        // Discounted return iteration (backwards)
-        for (int t = (int)memory.size() - 1; t >= 0; t--) {
-            G = memory[t].reward + gamma * G;
-            auto& m = memory[t];
+        for (int idx = 0; idx < N; idx++) {
+            float G = (returns[idx] - mean_r) / std_r;
 
-            // Re-calculate hidden state for gradients
-            std::vector<float> h(hidden_size);
-            for (int i = 0; i < hidden_size; i++) {
-                float sum = 0;
-                for (int j = 0; j < input_size; j++)
-                    sum += w1[i][j] * m.state[j];
-                h[i] = std::tanh(sum);
+            Cache cache;
+            Vec pred = forward_train(states[idx], cache);
+
+            // Output error: REINFORCE gradient
+            Vec out_err(NUM_ACTIONS, 0.f);
+            for (int i = 0; i < 4; i++) {
+                // tanh output: gradient of log-prob approximation
+                float act = outputs_taken[idx][i];
+                float p   = pred[i];
+                float dt  = 1.f - p * p; // d_tanh
+                out_err[i] = G * act * dt;
+            }
+            // Sigmoid shoot: binary cross-entropy style
+            {
+                float act = outputs_taken[idx][SHOOT_PROB];
+                float p   = pred[SHOOT_PROB];
+                out_err[SHOOT_PROB] = G * (act - p) * p * (1.f - p);
             }
 
-            // Update output layer w2
-            for (int i = 0; i < output_size; i++) {
-                // Policy gradient: (target_action - probability) * Return
-                float grad = ((i == m.action ? 1.0f : 0.0f) - m.probs[i]);
-                for (int j = 0; j < hidden_size; j++) {
-                    w2[i][j] += lr * G * grad * h[j];
-                    // Basic clipping
-                    if (w2[i][j] > 5.0f) w2[i][j] = 5.0f;
-                    if (w2[i][j] < -5.0f) w2[i][j] = -5.0f;
+            // Backprop through layer 4
+            Vec h3_err(H3, 0.f);
+            for (int i = 0; i < H3; i++) {
+                float e = 0;
+                for (int j = 0; j < NUM_ACTIONS; j++) {
+                    dw4[j][i] += out_err[j] * cache.h3[i];
+                    e         += w4[j][i] * out_err[j];
+                }
+                h3_err[i] = e;
+            }
+            for (int j = 0; j < NUM_ACTIONS; j++) db4[j] += out_err[j];
+
+            // Layer 3
+            Vec d3  = d_leaky_relu(cache.pre3);
+            Vec h2_err(H2, 0.f);
+            for (int i = 0; i < H2; i++) {
+                float e = 0;
+                for (int j = 0; j < H3; j++) {
+                    float g = h3_err[j] * d3[j];
+                    dw3[j][i] += g * cache.h2[i];
+                    e         += w3[j][i] * g;
+                }
+                h2_err[i] = e;
+            }
+            for (int j = 0; j < H3; j++) db3[j] += h3_err[j] * d3[j];
+
+            // Layer 2
+            Vec d2  = d_leaky_relu(cache.pre2);
+            Vec h1_err(H1, 0.f);
+            for (int i = 0; i < H1; i++) {
+                float e = 0;
+                for (int j = 0; j < H2; j++) {
+                    float g = h2_err[j] * d2[j];
+                    dw2[j][i] += g * cache.h1[i];
+                    e         += w2[j][i] * g;
+                }
+                h1_err[i] = e;
+            }
+            for (int j = 0; j < H2; j++) db2[j] += h2_err[j] * d2[j];
+
+            // Layer 1
+            Vec d1  = d_leaky_relu(cache.pre1);
+            for (int i = 0; i < STATE_DIM; i++) {
+                for (int j = 0; j < H1; j++) {
+                    dw1[j][i] += h1_err[j] * d1[j] * states[idx][i];
                 }
             }
-            
-            // Note: Simple REINFORCE often skips w1 backprop for speed in these games
-            // but we could add it if needed.
+            for (int j = 0; j < H1; j++) db1[j] += h1_err[j] * d1[j];
         }
-        memory.clear();
+
+        float scale = 1.f / N;
+        for (auto& row : dw1) for (auto& v : row) v *= scale;
+        for (auto& row : dw2) for (auto& v : row) v *= scale;
+        for (auto& row : dw3) for (auto& v : row) v *= scale;
+        for (auto& row : dw4) for (auto& v : row) v *= scale;
+        for (auto& v : db1) v *= scale;
+        for (auto& v : db2) v *= scale;
+        for (auto& v : db3) v *= scale;
+        for (auto& v : db4) v *= scale;
+
+        adam_update(w1, b1, dw1, db1, as1, lr);
+        adam_update(w2, b2, dw2, db2, as2, lr);
+        adam_update(w3, b3, dw3, db3, as3, lr);
+        adam_update(w4, b4, dw4, db4, as4, lr);
+    }
+
+    void save(const std::string& path) const {
+        std::ofstream f(path, std::ios::binary);
+        if (!f) { std::cerr << "Save failed: " << path << "\n"; return; }
+        auto wmat = [&](const Mat& M) {
+            for (auto& r : M) f.write((char*)r.data(), r.size()*sizeof(float));
+        };
+        auto wvec = [&](const Vec& v) {
+            f.write((char*)v.data(), v.size()*sizeof(float));
+        };
+        wmat(w1); wmat(w2); wmat(w3); wmat(w4);
+        wvec(b1); wvec(b2); wvec(b3); wvec(b4);
+        std::cout << "[Model] Saved to " << path << "\n";
+    }
+
+    void load(const std::string& path) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) { std::cout << "[Model] No weights found, starting fresh.\n"; return; }
+        auto rmat = [&](Mat& M) {
+            for (auto& r : M) f.read((char*)r.data(), r.size()*sizeof(float));
+        };
+        auto rvec = [&](Vec& v) {
+            f.read((char*)v.data(), v.size()*sizeof(float));
+        };
+        rmat(w1); rmat(w2); rmat(w3); rmat(w4);
+        rvec(b1); rvec(b2); rvec(b3); rvec(b4);
+        std::cout << "[Model] Loaded from " << path << "\n";
     }
 };
 
-// Main Game Controller
+// ─────────────────────────────────────────────
+// Experience Replay Buffer
+// ─────────────────────────────────────────────
+struct Experience {
+    Vec state, action;
+    float reward;
+};
+
+class ReplayBuffer {
+    std::deque<Experience> buf;
+    int capacity;
+public:
+    explicit ReplayBuffer(int cap = 8192) : capacity(cap) {}
+
+    void push(Vec s, Vec a, float r) {
+        if ((int)buf.size() >= capacity) buf.pop_front();
+        buf.push_back({std::move(s), std::move(a), r});
+    }
+
+    // Sample a random batch; returns discounted returns (Monte-Carlo style)
+    bool sample(int batch, std::vector<Vec>& states, std::vector<Vec>& actions, std::vector<float>& returns) const {
+        if ((int)buf.size() < batch) return false;
+        std::vector<int> idxs(buf.size());
+        std::iota(idxs.begin(), idxs.end(), 0);
+        // Random shuffle then take first `batch`
+        for (int i = (int)idxs.size()-1; i > 0; i--) {
+            int j = RNG::rng_int(0, i);
+            std::swap(idxs[i], idxs[j]);
+        }
+        idxs.resize(batch);
+
+        states.clear(); actions.clear(); returns.clear();
+        for (int i : idxs) {
+            states.push_back(buf[i].state);
+            actions.push_back(buf[i].action);
+            returns.push_back(buf[i].reward);
+        }
+        return true;
+    }
+
+    int size() const { return (int)buf.size(); }
+};
+
+// ─────────────────────────────────────────────
+// Game Entities
+// ─────────────────────────────────────────────
+class Entity {
+protected:
+    Vector2 pos;
+    int w, h;
+    SDL_Color color;
+    bool alive = true;
+public:
+    Entity(Vector2 p, int w, int h, SDL_Color c) : pos(p), w(w), h(h), color(c) {}
+    virtual ~Entity() = default;
+    virtual void update() = 0;
+    virtual void draw(SDL_Renderer* r, int ox, int oy) {
+        SDL_SetRenderDrawColor(r, color.r, color.g, color.b, color.a);
+        SDL_Rect rc = { (int)std::round(pos.x - w/2) + ox,
+                        (int)std::round(pos.y - h/2) + oy, w, h };
+        SDL_RenderFillRect(r, &rc);
+    }
+    bool is_alive() const { return alive; }
+    void die()           { alive = false; }
+    Vector2 get_pos()    const { return pos; }
+    SDL_Rect get_rect()  const { return { (int)(pos.x-w/2), (int)(pos.y-h/2), w, h }; }
+};
+
+class Particle : public Entity {
+    Vector2 vel;
+    int life;
+public:
+    Particle(Vector2 p, SDL_Color c)
+        : Entity(p, 4, 4, c), vel(RNG::flt(-3,3), RNG::flt(-3,3)), life(30) {}
+    void update() override { pos += vel; if (--life <= 0) die(); }
+};
+
+class Bullet : public Entity {
+    Vector2 vel;
+public:
+    Bullet(Vector2 p, Vector2 target, SDL_Color c, int sz, float spd)
+        : Entity(p, sz, sz, c) {
+        vel = (target - p).normalize() * spd;
+    }
+    void update() override {
+        pos += vel;
+        if (pos.x < -50 || pos.x > WIDTH+50 || pos.y < -50 || pos.y > HEIGHT+50) die();
+    }
+    Vector2 get_vel() const { return vel; }
+};
+
+class Player : public Entity {
+    Vector2 velocity;
+    int health = 100;
+    int shoot_cd = 0;
+    float speed = 6.f;
+public:
+    Player() : Entity({WIDTH/2.f, HEIGHT/2.f}, 28, 28, {240,240,255,255}) {}
+    void update() override { if (shoot_cd > 0) shoot_cd--; }
+    void move(Vector2 dir, bool restricted = false) {
+        if (dir.length() > 0) {
+            if (dir.length() > 1.f) dir = dir.normalize();
+            velocity = dir * speed;
+            pos += velocity;
+        } else { velocity = {0,0}; }
+        if (restricted) {
+            int cx = WIDTH/2, cy = HEIGHT/2;
+            clamp(cx-300, cx+300, cy-300, cy+300);
+        } else clamp(0, WIDTH, 0, HEIGHT);
+    }
+    void clamp(int x0, int x1, int y0, int y1) {
+        if (pos.x < x0+w/2) pos.x = x0+w/2;
+        if (pos.x > x1-w/2) pos.x = x1-w/2;
+        if (pos.y < y0+h/2) pos.y = y0+h/2;
+        if (pos.y > y1-h/2) pos.y = y1-h/2;
+    }
+    bool can_shoot()  const { return shoot_cd == 0; }
+    void fire()             { shoot_cd = 8; }
+    void take_damage(int d) { health -= d; }
+    int  get_health() const { return health; }
+    int  get_cd()     const { return shoot_cd; }
+    Vector2 get_vel() const { return velocity; }
+};
+
+class Enemy : public Entity {
+    Player*              player_ptr;
+    std::vector<Bullet*>& bullets_ref;
+    float  spiral_speed;
+    float  min_dist;
+    int    health = 150;
+    int    shoot_cd;
+    // For velocity tracking by AI
+    Vector2 prev_pos;
+    Vector2 vel_smooth;
+public:
+    Enemy(Player* p, std::vector<Bullet*>& eb)
+        : Entity({0,0}, 26, 26, {255, 60, 60, 255}),
+          player_ptr(p), bullets_ref(eb), min_dist(160.f)
+    {
+        // Spawn at edge
+        int side = RNG::rng_int(0,3);
+        if      (side==0) pos = {RNG::flt(0,WIDTH), -35};
+        else if (side==1) pos = {(float)WIDTH+35, RNG::flt(0,HEIGHT)};
+        else if (side==2) pos = {RNG::flt(0,WIDTH), (float)HEIGHT+35};
+        else              pos = {-35, RNG::flt(0,HEIGHT)};
+
+        spiral_speed = RNG::flt(1.5f, 4.5f) * (RNG::rng_int(0,1) ? 1 : -1) / 100.f;
+        shoot_cd     = RNG::rng_int(120, 240);
+        prev_pos     = pos;
+        vel_smooth   = {0,0};
+    }
+
+    void update() override {
+        Vector2 to_p   = player_ptr->get_pos() - pos;
+        float   dist   = to_p.length();
+        Vector2 dir    = to_p.normalize();
+
+        if (dist > min_dist)           pos += dir * 2.2f;
+        else if (dist < min_dist-20.f) pos -= dir * 1.1f;
+
+        Vector2 perp = {-dir.y, dir.x};
+        pos += perp * (spiral_speed * 140.f);
+
+        // Track own velocity for AI exposure
+        Vector2 raw  = pos - prev_pos;
+        vel_smooth   = vel_smooth * 0.7f + raw * 0.3f;
+        prev_pos     = pos;
+
+        if (--shoot_cd <= 0) {
+            float bspd = 5.2f;
+            float t    = dist / bspd;
+            Vector2 pred = player_ptr->get_pos() + player_ptr->get_vel() * t;
+            bullets_ref.push_back(new Bullet(pos, pred, {255,100,100,255}, 8, bspd));
+            shoot_cd = RNG::rng_int(80, 160);
+        }
+    }
+
+    void take_damage(int d) { health -= d; if (health <= 0) die(); }
+    int     get_health()    const { return health; }
+    Vector2 get_vel_smooth()const { return vel_smooth; }
+};
+
+class Background {
+    SDL_Texture* tex = nullptr;
+    int bw = 0, bh = 0;
+    float scroll = 0;
+public:
+    Background(SDL_Renderer* r) {
+        tex = IMG_LoadTexture(r, "back.jpg");
+        if (tex) SDL_QueryTexture(tex, NULL, NULL, &bw, &bh);
+    }
+    ~Background() { if (tex) SDL_DestroyTexture(tex); }
+    void update() { scroll += 0.8f; if (scroll >= bw) scroll = 0; }
+    void draw(SDL_Renderer* r, int ox, int oy) {
+        if (!tex) return;
+        SDL_Rect r1 = {(int)-scroll+ox, oy, bw, HEIGHT};
+        SDL_Rect r2 = {(int)(bw-scroll)+ox, oy, bw, HEIGHT};
+        SDL_RenderCopy(r, tex, NULL, &r1);
+        SDL_RenderCopy(r, tex, NULL, &r2);
+    }
+};
+
+// ─────────────────────────────────────────────
+// Game
+// ─────────────────────────────────────────────
 class Game {
-private:
-    SDL_Window* window;
-    SDL_Renderer* renderer;
-    TTF_Font* font;
-    
-    Player* player;
-    Model* model;
-    Background* bg;
-    
-    std::vector<Enemy*> enemies;
-    std::vector<Bullet*> player_bullets;
-    std::vector<Bullet*> enemy_bullets;
+    SDL_Window*   window   = nullptr;
+    SDL_Renderer* renderer = nullptr;
+    TTF_Font*     font     = nullptr;
+
+    Player*     player = nullptr;
+    PolicyNet*  net    = nullptr;
+    Background* bg     = nullptr;
+
+    std::vector<Enemy*>    enemies;
+    std::vector<Bullet*>   p_bullets, e_bullets;
     std::vector<Particle*> particles;
 
-    Vector2 prev_enemy_pos;
-    int score;
-    float total_reward;
-    int spawn_timer;
-    int shake_amount;
-    bool running;
+    ReplayBuffer replay{8192};
+
+    int   score        = 0;
+    float total_reward = 0.f;
+    int   spawn_timer  = 0;
+    int   shake        = 0;
+    bool  running      = true;
+    bool  ai_mode      = true;
+
+    // Epsilon for exploration
+    float epsilon = 0.5f;
+    static constexpr float EPS_MIN  = 0.04f;
+    static constexpr float EPS_DECAY= 0.99995f;
+
+    int   train_every = 64;  // steps between training
+    int   step_count  = 0;
+
+    // Nearest-bullet distance last frame (for dodge reward)
+    float prev_min_b_dist = 1e9f;
+
+    // Enemy velocity smoothing (for state)
+    Vector2 tracked_enemy_vel = {0,0};
+    Vector2 tracked_enemy_pos = {0,0};
+
+    uint8_t keys[SDL_NUM_SCANCODES] = {};
+
+    // Hit/accuracy stats
+    int shots_fired = 0, shots_hit = 0;
 
 public:
-    Game() : window(nullptr), renderer(nullptr), font(nullptr), 
-             player(nullptr), model(nullptr), bg(nullptr),
-             score(0), total_reward(0), spawn_timer(0), shake_amount(0), running(false) {}
-
     ~Game() { cleanup(); }
 
-    bool init() {
-        if (SDL_Init(SDL_INIT_VIDEO) < 0) return false;
-        if (!(IMG_Init(IMG_INIT_JPG) & IMG_INIT_JPG)) return false;
-        if (TTF_Init() < 0) return false;
+    bool init(bool ai) {
+        ai_mode = ai;
+        if (SDL_Init(SDL_INIT_VIDEO) < 0) { std::cerr << SDL_GetError() << "\n"; return false; }
+        if (!(IMG_Init(IMG_INIT_JPG) & IMG_INIT_JPG)) {}
+        if (TTF_Init() < 0) {}
 
-        window = SDL_CreateWindow("Spiral Shooter OOP", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH, HEIGHT, 0);
-        if (!window) return false;
+        window   = SDL_CreateWindow("Spiral Shooter ── AI Enhanced",
+                                    SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                    WIDTH, HEIGHT, 0);
+        renderer = SDL_CreateRenderer(window, -1,
+                                      SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
 
-        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-        if (!renderer) return false;
-
-        font = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24);
-        if (!font) font = TTF_OpenFont("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", 24);
+        const char* fonts[] = {
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            nullptr
+        };
+        for (int i = 0; fonts[i]; i++) {
+            font = TTF_OpenFont(fonts[i], 22);
+            if (font) break;
+        }
 
         player = new Player();
-        model = new Model(9, 6); // 8 inputs + 1 bias, 6 outputs
+        net    = new PolicyNet();
+        if (ai_mode) net->load("model.weights");
         bg = new Background(renderer);
-        running = true;
         return true;
     }
 
@@ -446,323 +664,464 @@ public:
     }
 
 private:
+    // ── State Vector (16 features) ──────────────
+    Vec get_state() const {
+        Vec s;
+        // Player position (normalised)
+        s.push_back(player->get_pos().x / WIDTH);
+        s.push_back(player->get_pos().y / HEIGHT);
+        // Player velocity
+        s.push_back(player->get_vel().x / 8.f);
+        s.push_back(player->get_vel().y / 8.f);
+
+        // Nearest enemy: relative direction + distance + velocity
+        float  min_ed = 1e9f;
+        Vector2 near_e = {0,0};
+        Enemy*  near_ep = nullptr;
+        for (auto* e : enemies) {
+            float d = player->get_pos().distance_to(e->get_pos());
+            if (d < min_ed) { min_ed = d; near_e = e->get_pos(); near_ep = e; }
+        }
+        Vector2 e_rel_dir = (near_e - player->get_pos()).normalize();
+        s.push_back(e_rel_dir.x);
+        s.push_back(e_rel_dir.y);
+        s.push_back(std::min(1.f, min_ed / 900.f));   // normalised distance
+
+        // Enemy velocity (for predictive aim)
+        Vector2 ev = near_ep ? near_ep->get_vel_smooth() : Vector2{0,0};
+        s.push_back(ev.x / 5.f);
+        s.push_back(ev.y / 5.f);
+
+        // Nearest enemy bullet: direction + distance
+        float  min_bd = 1e9f;
+        Vector2 near_b = {0,0};
+        Vector2 near_bv= {0,0};
+        for (auto* b : e_bullets) {
+            float d = player->get_pos().distance_to(b->get_pos());
+            if (d < min_bd) { min_bd = d; near_b = b->get_pos(); near_bv = b->get_vel(); }
+        }
+        Vector2 b_dir = (near_b - player->get_pos()).normalize();
+        s.push_back(b_dir.x);
+        s.push_back(b_dir.y);
+        s.push_back(std::min(1.f, min_bd / 500.f));
+
+        // Incoming bullet velocity direction (is it heading toward player?)
+        Vector2 b_vel_n = near_bv.normalize();
+        s.push_back(b_vel_n.x);
+        s.push_back(b_vel_n.y);
+
+        // Shoot cooldown readiness
+        s.push_back(1.f - player->get_cd() / 10.f);
+
+        // Player health
+        s.push_back(player->get_health() / 100.f);
+
+        assert((int)s.size() == STATE_DIM);
+        return s;
+    }
+
+    // ── Predictive aim target for the nearest enemy ──
+    Vector2 predict_aim(const Vector2& p_pos, const Vector2& e_pos, const Vector2& e_vel, float b_speed) {
+        float dist = p_pos.distance_to(e_pos);
+        // Iterative refinement (3 iterations)
+        Vector2 pred = e_pos;
+        for (int i = 0; i < 3; i++) {
+            float t   = p_pos.distance_to(pred) / b_speed;
+            pred      = e_pos + e_vel * t;
+        }
+        // Clamp: don't predict too far
+        if (p_pos.distance_to(pred) > dist + 250.f) pred = e_pos;
+        return pred;
+    }
+
     void handle_events() {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = false;
+            if (e.type == SDL_KEYDOWN) {
+                keys[e.key.keysym.scancode] = 1;
+                if (e.key.keysym.scancode == SDL_SCANCODE_ESCAPE) running = false;
+            }
+            if (e.type == SDL_KEYUP)   keys[e.key.keysym.scancode] = 0;
+            if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT)  keys[SDL_SCANCODE_KP_0] = 1;
+            if (e.type == SDL_MOUSEBUTTONUP   && e.button.button == SDL_BUTTON_LEFT)  keys[SDL_SCANCODE_KP_0] = 0;
         }
     }
 
-    std::vector<float> get_state() {
-        std::vector<float> s;
-        s.push_back(player->get_pos().x / WIDTH);
-        s.push_back(player->get_pos().y / HEIGHT);
-        s.push_back(player->get_velocity().x / 10.0f);
-        s.push_back(player->get_velocity().y / 10.0f);
+    void reset() {
+        for (auto* e : enemies)   delete e;
+        for (auto* b : p_bullets) delete b;
+        for (auto* b : e_bullets) delete b;
+        for (auto* p : particles) delete p;
+        enemies.clear(); p_bullets.clear(); e_bullets.clear(); particles.clear();
 
-        float min_d = 1e9;
-        Vector2 nearest_rel = {0,0};
-        Vector2 nearest_pos = {0,0};
-        bool found_enemy = false;
+        delete player; player = new Player();
 
-        for (auto e : enemies) {
-            float d = player->get_pos().distance_to(e->get_pos());
-            if (d < min_d) {
-                min_d = d;
-                nearest_rel = e->get_pos() - player->get_pos();
-                nearest_pos = e->get_pos();
-                found_enemy = true;
-            }
-        }
+        // Print accuracy
+        float acc = shots_fired > 0 ? 100.f * shots_hit / shots_fired : 0.f;
+        std::cout << "[Stats] Score=" << score
+                  << " Accuracy=" << acc << "% (" << shots_hit << "/" << shots_fired << ")\n";
 
-        s.push_back(nearest_rel.x / WIDTH);
-        s.push_back(nearest_rel.y / HEIGHT);
+        score = 0; total_reward = 0; spawn_timer = 0; shake = 0;
+        prev_min_b_dist = 1e9f;
+        tracked_enemy_vel = {0,0};
+        tracked_enemy_pos = {0,0};
+        shots_fired = shots_hit = 0;
 
-        // enemy velocity (prediction)
-        Vector2 enemy_vel = {0, 0};
-        if (found_enemy) {
-            if (prev_enemy_pos.length() > 0) { 
-                enemy_vel = nearest_pos - prev_enemy_pos;
-                // Clamp velocity to prevent state spikes when nearest enemy switches
-                if (enemy_vel.length() > 50.0f) enemy_vel = {0, 0}; 
-            }
-            prev_enemy_pos = nearest_pos;
-        } else {
-            prev_enemy_pos = {0, 0};
-        }
-        s.push_back(enemy_vel.x / 10.0f);
-        s.push_back(enemy_vel.y / 10.0f);
-        
-        // Add BIAS term (constant 1.0) so model can learn baseline action preference
-        s.push_back(1.0f); 
-
-        return s;
+        if (ai_mode) net->save("model.weights");
+        std::cout << "[Game] Reset\n";
     }
 
     void update() {
-        std::vector<float> state = get_state();
-        auto probs = model->forward_probs(state);
-        int action = model->sample_action(probs);
-
-        // Movement
-        Vector2 move_dir = {0, 0};
-        if (action == UP) move_dir.y -= 1;
-        if (action == DOWN) move_dir.y += 1;
-        if (action == LEFT) move_dir.x -= 1;
-        if (action == RIGHT) move_dir.x += 1;
-        player->move(move_dir);
         player->update();
+        bg->update();
 
-        // Shooting
-        Vector2 nearest_enemy_pos = player->get_pos();
-        float nearest_enemy_distance = 1e9;
-        bool found_enemy = false;
-        for (auto en : enemies) {
-            float d = player->get_pos().distance_to(en->get_pos());
-            if (d < nearest_enemy_distance) {
-                nearest_enemy_distance = d;
-                nearest_enemy_pos = en->get_pos();
-                found_enemy = true;
+        // Update enemy velocity tracking
+        {
+            float min_d = 1e9f;
+            Enemy* near = nullptr;
+            for (auto* e : enemies) {
+                float d = player->get_pos().distance_to(e->get_pos());
+                if (d < min_d) { min_d = d; near = e; }
+            }
+            if (near) {
+                tracked_enemy_vel = near->get_vel_smooth();
+                tracked_enemy_pos = near->get_pos();
             }
         }
 
-        // Rewards
-        float reward = 0;
+        Vec state = get_state();
+        Vec act(NUM_ACTIONS, 0.f);
 
-        // survival
-        reward += 0.01f;
+        if (ai_mode) {
+            act = net->forward(state, nullptr, false);
 
-        // high reward for close + shooting
-        if (action == SHOOT && player->can_shoot()) {
-            player_bullets.push_back(new Bullet(player->get_pos(), nearest_enemy_pos, { 130, 200, 77, 255 }, 10, 10));
-            player->reset_shoot_timeout();
-            if (found_enemy) {
-                reward += (200.0f - nearest_enemy_distance) * 0.05f;
+            // Gaussian exploration noise (decaying)
+            for (int i = 0; i < 4; i++) {
+                act[i] += RNG::normal(0, epsilon);
+                act[i]  = std::clamp(act[i], -1.f, 1.f);
+            }
+            act[SHOOT_PROB] += RNG::normal(0, epsilon * 0.4f);
+            act[SHOOT_PROB]  = std::clamp(act[SHOOT_PROB], 0.f, 1.f);
+
+            epsilon = std::max(EPS_MIN, epsilon * EPS_DECAY);
+        } else {
+            // ── Human input ──
+            if (keys[SDL_SCANCODE_W]) act[MOVE_Y] = -1.f;
+            if (keys[SDL_SCANCODE_S]) act[MOVE_Y] =  1.f;
+            if (keys[SDL_SCANCODE_A]) act[MOVE_X] = -1.f;
+            if (keys[SDL_SCANCODE_D]) act[MOVE_X] =  1.f;
+
+            int mx, my;
+            SDL_GetMouseState(&mx, &my);
+            Vector2 aim = (Vector2{(float)mx, (float)my} - player->get_pos()).normalize();
+            act[AIM_X] = aim.x; act[AIM_Y] = aim.y;
+            if (keys[SDL_SCANCODE_SPACE] || keys[SDL_SCANCODE_KP_0]) act[SHOOT_PROB] = 1.f;
+        }
+
+        // ── Move ──
+        Vector2 move_dir = {act[MOVE_X], act[MOVE_Y]};
+        player->move(move_dir, ai_mode);
+
+        // ── Reward ──
+        float reward = 0.03f; // survival tick
+
+        // Center preference (softer)
+        Vector2 p_pos = player->get_pos();
+        float center_d = p_pos.distance_to({WIDTH/2.f, HEIGHT/2.f});
+        reward -= center_d * 0.00008f;
+
+        // Boundary penalty
+        if (ai_mode) {
+            int cx = WIDTH/2, cy = HEIGHT/2;
+            if (p_pos.x < cx-290 || p_pos.x > cx+290 || p_pos.y < cy-290 || p_pos.y > cy+290)
+                reward -= 2.f;
+        }
+
+        // Movement reward
+        if (move_dir.length() < 0.05f) reward -= 0.05f;
+        else reward += 0.01f;
+
+        // ── Dodge reward ──
+        float min_bd = 1e9f;
+        Vector2 near_bp = {0,0}, near_bv = {0,0};
+        for (auto* b : e_bullets) {
+            float d = p_pos.distance_to(b->get_pos());
+            if (d < min_bd) { min_bd = d; near_bp = b->get_pos(); near_bv = b->get_vel(); }
+        }
+        if (min_bd < 250.f) {
+            // Reward increasing distance to bullet
+            if (min_bd > prev_min_b_dist) reward += 0.25f;
+            // Reward moving perpendicular/away from bullet trajectory
+            Vector2 away  = (p_pos - near_bp).normalize();
+            Vector2 bdir  = near_bv.normalize();
+            float   align = move_dir.normalize().dot(away);
+            float   oncoming = -move_dir.normalize().dot(bdir); // reward if moving opposite bullet
+            reward += align * 0.35f + oncoming * 0.15f;
+        }
+        prev_min_b_dist = min_bd;
+
+        // ── Enemy distance penalty ──
+        bool has_enemy = !enemies.empty();
+        float min_ed   = 1e9f;
+        Vector2 near_ep= {0,0};
+        Vector2 near_ev= {0,0};
+        for (auto* e : enemies) {
+            float d = p_pos.distance_to(e->get_pos());
+            if (d < min_ed) { min_ed = d; near_ep = e->get_pos(); near_ev = e->get_vel_smooth(); }
+        }
+        if (has_enemy && min_ed < 110.f) reward -= 0.12f;
+
+        // ── Shoot ──
+        if (act[SHOOT_PROB] > 0.5f && player->can_shoot()) {
+            if (has_enemy) {
+                reward += 0.15f; // reward for taking shot
+                if (step_count < 20000) reward += 0.2f; // early training spam encouragement
+
+                reward -= 0.02f;  // ammo cost
+
+                float b_speed = 10.f;
+                Vector2 aim_dir = {act[AIM_X], act[AIM_Y]};
+
+                if (ai_mode) {
+                    // Compute predictive aim
+                    Vector2 pred_target = predict_aim(p_pos, near_ep, near_ev, b_speed);
+                    Vector2 pred_dir    = (pred_target - p_pos).normalize();
+
+                    // Blend AI aim with prediction (60/40)
+                    if (aim_dir.length() > 0.1f) {
+                        aim_dir = (aim_dir.normalize() * 0.6f + pred_dir * 0.4f).normalize();
+                    } else {
+                        aim_dir = pred_dir;
+                    }
+
+                    // Aim quality reward — use angle to enemy (tighter = bigger reward)
+                    Vector2 to_e  = (near_ep - p_pos).normalize();
+                    float   aq    = aim_dir.dot(to_e); // [-1, 1]
+                    if (aq > 0.90f) reward += 1.2f;      // near-perfect aim → big reward
+                    else if (aq > 0.7f) reward += 0.5f;
+                    else if (aq > 0.4f) reward += 0.1f;
+                    else reward -= 0.1f; // punish wild shots
+
+                    // Punish shooting at distant targets
+                    if (min_ed > 450.f) reward -= 0.4f;
+
+                    Vector2 fire_target = p_pos + aim_dir * 1200.f;
+                    p_bullets.push_back(new Bullet(p_pos, fire_target, {120,220,80,255}, 10, b_speed));
+                    player->fire();
+                    shots_fired++;
+                } else {
+                    // Human: use mouse aim
+                    if (aim_dir.length() < 0.1f)
+                        aim_dir = (near_ep - p_pos).normalize();
+                    else
+                        aim_dir = aim_dir.normalize();
+                    Vector2 fire_target = p_pos + aim_dir * 1200.f;
+                    p_bullets.push_back(new Bullet(p_pos, fire_target, {120,220,80,255}, 10, b_speed));
+                    player->fire();
+                    shots_fired++;
+                }
+            } else {
+                reward -= 0.35f; // shooting with no target
             }
         }
 
-        // but also risk
-        if (found_enemy && nearest_enemy_distance < 80) {
-            reward -= 0.1f;
-        }
+        reward = std::clamp(reward, -10.f, 10.f);
 
-        // reward aiming (alignment)
-        if (found_enemy) {
-            Vector2 to_enemy = nearest_enemy_pos - player->get_pos();
-            Vector2 forward = player->get_velocity();
-            if (forward.length() > 0) {
-                float align = (to_enemy.normalize().x * forward.normalize().x +
-                               to_enemy.normalize().y * forward.normalize().y);
-                reward += align * 0.02f;
+        // Update all entities; reward may be modified
+        update_entities(reward);
+
+        total_reward += reward;
+        step_count++;
+
+        if (ai_mode) {
+            replay.push(state, act, reward);
+            if (step_count % train_every == 0 && replay.size() >= 256) {
+                std::vector<Vec> s_batch, a_batch;
+                std::vector<float> r_batch;
+                if (replay.sample(256, s_batch, a_batch, r_batch)) {
+                    net->train_batch(s_batch, a_batch, r_batch);
+                    float avg_r = 0; for (float r : r_batch) avg_r += r;
+                    avg_r /= r_batch.size();
+                    std::cout << "[Train] step=" << step_count
+                              << " eps=" << epsilon
+                              << " avg_r=" << avg_r
+                              << " buf=" << replay.size() << "\n";
+                }
             }
+            if (step_count % 2000 == 0) net->save("model.weights");
         }
 
-        // Spawning
-        if (++spawn_timer >= std::max(30, 90 - (score / 500)) && enemies.size() < 5) {
-            enemies.push_back(new Enemy(player, enemy_bullets));
+        // Spawn enemies
+        int max_enemies = std::min(8, 2 + score/500);
+        int spawn_interval = std::max(20, 80 - score/300);
+        if (++spawn_timer >= spawn_interval && (int)enemies.size() < max_enemies) {
+            enemies.push_back(new Enemy(player, e_bullets));
             spawn_timer = 0;
         }
-
-        bg->update();
-        update_entities(reward);
-        
-        total_reward += reward;
-        model->remember(state, action, reward, probs);
     }
 
     void update_entities(float& reward) {
         // Enemies
-        for (auto it = enemies.begin(); it != enemies.end();) {
-            (*it)->update();
-            
-            bool enemy_dead = false;
-            SDL_Rect er = (*it)->get_rect();
+        for (auto eit = enemies.begin(); eit != enemies.end();) {
+            (*eit)->update();
+            bool killed = false;
+            SDL_Rect er = (*eit)->get_rect();
 
-            // Collision with player bullets
-            for (auto bit = player_bullets.begin(); bit != player_bullets.end();) {
+            for (auto bit = p_bullets.begin(); bit != p_bullets.end();) {
                 SDL_Rect br = (*bit)->get_rect();
                 if (SDL_HasIntersection(&er, &br)) {
-                    // Proximity damage logic:
-                    float dist = player->get_pos().distance_to((*it)->get_pos());
-                    int damage = 25;
-                    
-                    if (dist < CUBE_SIZE) {
-                        damage = 100; // Point-blank one-shot
-                    } else {
-                        // Inverse square scaling: Damage = 90 * (CUBE_SIZE / dist)^2
-                        float scale = (CUBE_SIZE * CUBE_SIZE) / (dist * dist);
-                        damage = (int)(90.0f * scale);
-                        if (damage < 50 && dist > 300) damage = 50; 
-                        if (damage > 90) damage = 90;
-                    }
-
-                    (*it)->take_damage(damage);
-                    reward += 15.0f; // hit reward
-                    delete *bit;
-                    bit = player_bullets.erase(bit);
-                    if (!(*it)->is_alive()) {
-                        spawn_particles((*it)->get_pos());
-                        score += 100;
-                        reward += 50.0f; // kill reward
-                        enemy_dead = true;
+                    (*eit)->take_damage(50);
+                    reward     += 8.f;
+                    shots_hit  += 1;
+                    delete *bit; bit = p_bullets.erase(bit);
+                    if (!(*eit)->is_alive() && !killed) {
+                        spawn_particles((*eit)->get_pos());
+                        score   += 100;
+                        reward  += 100.f;
+                        killed   = true;
                     }
                 } else ++bit;
             }
 
-            if (enemy_dead) {
-                delete *it;
-                it = enemies.erase(it);
-            } else {
-                SDL_Rect pr = player->get_rect();
-                if (SDL_HasIntersection(&er, &pr)) {
-                    reward -= 10.0f; // death penalty
-                    std::cout << "GAME OVER: Touched enemy! | Score: " << score << " | Reward: " << total_reward + reward << std::endl;
-                    model->train();
-                    running = false;
+            if (killed) { delete *eit; eit = enemies.erase(eit); continue; }
+
+            // Player collision with enemy body
+            SDL_Rect pr = player->get_rect();
+            if (SDL_HasIntersection(&er, &pr)) {
+                reward -= 5.f;
+                std::cout << "[Game] Over — collided with enemy\n";
+                if (ai_mode) {
+                    std::vector<Vec> sb, ab; std::vector<float> rb;
+                    if (replay.sample(128, sb, ab, rb)) net->train_batch(sb, ab, rb);
                 }
-                ++it;
+                reset(); return;
             }
+            ++eit;
         }
 
-        // Bullets
-        auto update_bullets = [&](std::vector<Bullet*>& bullets) {
-            for (auto it = bullets.begin(); it != bullets.end();) {
-                (*it)->update();
-                
-                // Optimized near miss reward
-                float min_d = 1e9;
-                for (auto e : enemies) {
-                    float d = (*it)->get_pos().distance_to(e->get_pos());
-                    if (d < min_d) min_d = d;
-                }
-                if (min_d < 50) reward += 0.01f;
+        // Player bullets (near-miss shaping)
+        for (auto bit = p_bullets.begin(); bit != p_bullets.end();) {
+            (*bit)->update();
+            if (!(*bit)->is_alive()) { delete *bit; bit = p_bullets.erase(bit); }
+            else ++bit;
+        }
 
-                if (!(*it)->is_alive()) { delete *it; it = bullets.erase(it); }
-                else ++it;
-            }
-        };
-        update_bullets(player_bullets);
-
-        // Enemy Bullets vs Player
-        for (auto it = enemy_bullets.begin(); it != enemy_bullets.end();) {
-            (*it)->update();
-            SDL_Rect br = (*it)->get_rect();
-            SDL_Rect pr = player->get_rect();
+        // Enemy bullets
+        for (auto bit = e_bullets.begin(); bit != e_bullets.end();) {
+            (*bit)->update();
+            SDL_Rect br = (*bit)->get_rect(), pr = player->get_rect();
             if (SDL_HasIntersection(&br, &pr)) {
-                // High-risk proximity damage logic for player
-                float dist = player->get_pos().distance_to((*it)->get_pos());
-                int damage = 25;
-
-                if (dist < CUBE_SIZE) {
-                    damage = 100; // Point-blank instant/lethal
-                } else {
-                    float scale = (CUBE_SIZE * CUBE_SIZE) / (dist * dist);
-                    damage = (int)(90.0f * scale);
-                    if (damage < 50 && dist > 300) damage = 50;
-                    if (damage > 90) damage = 90;
-                }
-
-                player->take_damage(damage);
-                reward -= (float)damage; 
-                shake_amount = 10;
-                delete *it;
-                it = enemy_bullets.erase(it);
+                player->take_damage(40);
+                reward   -= 2.5f;
+                shake     = 12;
+                delete *bit; bit = e_bullets.erase(bit);
                 if (player->get_health() <= 0) {
-                    reward -= 10.0f; // death penalty
-                    std::cout << "GAME OVER: HP zero! | Score: " << score << " | Reward: " << total_reward + reward << std::endl;
-                    model->train();
-                    running = false;
+                    reward -= 5.f;
+                    std::cout << "[Game] Over — HP zero\n";
+                    if (ai_mode) {
+                        std::vector<Vec> sb, ab; std::vector<float> rb;
+                        if (replay.sample(128, sb, ab, rb)) net->train_batch(sb, ab, rb);
+                    }
+                    reset(); return;
                 }
-            } else if (!(*it)->is_alive()) { delete *it; it = enemy_bullets.erase(it); }
-            else ++it;
+            } else if (!(*bit)->is_alive()) { delete *bit; bit = e_bullets.erase(bit); }
+            else ++bit;
         }
 
         // Particles
-        for (auto it = particles.begin(); it != particles.end();) {
-            (*it)->update();
-            if (!(*it)->is_alive()) { delete *it; it = particles.erase(it); }
-            else ++it;
+        for (auto pit = particles.begin(); pit != particles.end();) {
+            (*pit)->update();
+            if (!(*pit)->is_alive()) { delete *pit; pit = particles.erase(pit); }
+            else ++pit;
         }
     }
 
-    void spawn_particles(Vector2 pos) {
-        for (int i = 0; i < 10; i++) particles.push_back(new Particle(pos, { 255, 50, 50, 255 }));
+    void spawn_particles(Vector2 p) {
+        SDL_Color colors[] = {{255,80,80,255},{255,160,60,255},{255,255,100,255}};
+        for (int i = 0; i < 14; i++)
+            particles.push_back(new Particle(p, colors[RNG::rng_int(0,2)]));
     }
 
     void render() {
         int ox = 0, oy = 0;
-        if (shake_amount > 0) {
-            ox = Random::get_int(-shake_amount, shake_amount);
-            oy = Random::get_int(-shake_amount, shake_amount);
-            shake_amount--;
+        if (shake > 0) {
+            ox = RNG::rng_int(-shake, shake);
+            oy = RNG::rng_int(-shake, shake);
+            shake--;
+        }
+        SDL_SetRenderDrawColor(renderer, 20, 20, 28, 255);
+        SDL_RenderClear(renderer);
+        bg->draw(renderer, ox, oy);
+
+        // AI play-zone indicator
+        if (ai_mode) {
+            SDL_SetRenderDrawColor(renderer, 80, 80, 160, 60);
+            int cx = WIDTH/2, cy = HEIGHT/2;
+            SDL_Rect zone = {cx-300+ox, cy-300+oy, 600, 600};
+            SDL_RenderDrawRect(renderer, &zone);
         }
 
-        SDL_SetRenderDrawColor(renderer, 30, 30, 30, 255);
-        SDL_RenderClear(renderer);
-
-        bg->draw(renderer, ox, oy);
-        for (auto p : particles) p->draw(renderer, ox, oy);
-        for (auto b : player_bullets) b->draw(renderer, ox, oy);
-        for (auto b : enemy_bullets) b->draw(renderer, ox, oy);
-        for (auto e : enemies) e->draw(renderer, ox, oy);
+        for (auto* p : particles)  p->draw(renderer, ox, oy);
+        for (auto* b : p_bullets)  b->draw(renderer, ox, oy);
+        for (auto* b : e_bullets)  b->draw(renderer, ox, oy);
+        for (auto* e : enemies) {
+            e->draw(renderer, ox, oy);
+            char buf[8]; sprintf(buf, "%d", e->get_health());
+            render_text(buf, (int)e->get_pos().x+ox, (int)e->get_pos().y-32+oy, {255,100,100,255}, true);
+        }
         player->draw(renderer, ox, oy);
-
-        draw_ui();
-
+        draw_hud();
         SDL_RenderPresent(renderer);
     }
 
-    void draw_ui() {
+    void render_text(const char* txt, int x, int y, SDL_Color c, bool center = false) {
         if (!font) return;
-        char buf[64];
-        
-        auto render_text = [&](const char* text, int x, int y) {
-            SDL_Surface* surf = TTF_RenderText_Solid(font, text, { 255, 255, 255, 255 });
-            SDL_Texture* tex = SDL_CreateTextureFromSurface(renderer, surf);
-            SDL_Rect dest = { x, y, surf->w, surf->h };
-            SDL_RenderCopy(renderer, tex, NULL, &dest);
-            SDL_FreeSurface(surf);
-            SDL_DestroyTexture(tex);
-        };
+        SDL_Surface* surf = TTF_RenderText_Solid(font, txt, c);
+        if (!surf) return;
+        SDL_Texture* tex = SDL_CreateTextureFromSurface(renderer, surf);
+        SDL_Rect dst = {x - (center ? surf->w/2 : 0), y, surf->w, surf->h};
+        SDL_RenderCopy(renderer, tex, NULL, &dst);
+        SDL_FreeSurface(surf);
+        SDL_DestroyTexture(tex);
+    }
 
-        sprintf(buf, "HP: %d", player->get_health());
-        render_text(buf, 10, 10);
-        sprintf(buf, "Score: %d", score);
-        render_text(buf, 10, 40);
-        sprintf(buf, "Reward: %.2f", total_reward);
-        render_text(buf, 10, 70);
+    void draw_hud() {
+        if (!font) return;
+        char buf[128];
+        float acc = shots_fired > 0 ? 100.f * shots_hit / shots_fired : 0.f;
+        sprintf(buf, "HP: %d",        player->get_health()); render_text(buf, 12, 12,  {240,240,255,255});
+        sprintf(buf, "Score: %d",     score);                render_text(buf, 12, 40,  {240,240,255,255});
+        sprintf(buf, "Reward: %.1f",  total_reward);         render_text(buf, 12, 68,  {180,240,180,255});
+        sprintf(buf, "Acc: %.1f%%",   acc);                  render_text(buf, 12, 96,  {255,220,80,255});
+        sprintf(buf, "Eps: %.3f",     epsilon);              render_text(buf, 12, 124, {160,200,255,255});
+        sprintf(buf, "Buf: %d",       replay.size());        render_text(buf, 12, 152, {160,200,255,255});
+        if (!ai_mode) render_text("HUMAN MODE", WIDTH-160, 12, {255,200,80,255});
+        else          render_text("AI MODE",    WIDTH-130, 12, {80,220,255,255});
     }
 
     void cleanup() {
-        delete player; player = nullptr;
-        delete model; model = nullptr;
-        delete bg; bg = nullptr;
-        
-        for (auto e : enemies) delete e; 
-        enemies.clear();
-        
-        for (auto b : player_bullets) delete b; 
-        player_bullets.clear();
-        
-        for (auto b : enemy_bullets) delete b; 
-        enemy_bullets.clear();
-        
-        for (auto p : particles) delete p; 
-        particles.clear();
-
-        if (font) TTF_CloseFont(font);
+        if (net) net->save("model.weights");
+        delete player; delete net; delete bg;
+        for (auto* e : enemies)   delete e;
+        for (auto* b : p_bullets) delete b;
+        for (auto* b : e_bullets) delete b;
+        for (auto* p : particles) delete p;
+        if (font)     TTF_CloseFont(font);
         if (renderer) SDL_DestroyRenderer(renderer);
-        if (window) SDL_DestroyWindow(window);
-        TTF_Quit();
-        IMG_Quit();
-        SDL_Quit();
+        if (window)   SDL_DestroyWindow(window);
+        TTF_Quit(); IMG_Quit(); SDL_Quit();
     }
 };
 
+// ─────────────────────────────────────────────
 int main(int argc, char* argv[]) {
-    Game game;
-    if (game.init()) {
-        game.run();
+    bool ai = true;
+    if (argc > 1) {
+        std::string arg = argv[1];
+        if (arg == "h" || arg == "human") ai = false;
     }
+    Game game;
+    if (game.init(ai)) game.run();
     return 0;
 }
