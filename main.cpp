@@ -426,20 +426,39 @@ protected:
     int w, h;
     SDL_Color color;
     bool alive = true;
+    SDL_Texture* tex = nullptr;
+    float angle = 0;
 public:
     Entity(Vector2 p, int w, int h, SDL_Color c) : pos(p), w(w), h(h), color(c) {}
     virtual ~Entity() = default;
     virtual void update() = 0;
     virtual void draw(SDL_Renderer* r, int ox, int oy) {
-        SDL_SetRenderDrawColor(r, color.r, color.g, color.b, color.a);
         SDL_Rect rc = { (int)std::round(pos.x - w/2) + ox,
                         (int)std::round(pos.y - h/2) + oy, w, h };
-        SDL_RenderFillRect(r, &rc);
+        if (tex) {
+            SDL_RenderCopyEx(r, tex, NULL, &rc, (double)angle, NULL, SDL_FLIP_NONE);
+        } else {
+            // Glow effect
+            SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(r, color.r, color.g, color.b, 60);
+            SDL_Rect glow = { rc.x - 2, rc.y - 2, w + 4, h + 4 };
+            SDL_RenderFillRect(r, &glow);
+
+            // Main body
+            SDL_SetRenderDrawColor(r, color.r, color.g, color.b, color.a);
+            SDL_RenderFillRect(r, &rc);
+        }
+
+        // Hitbox outline (Yellow)
+        SDL_SetRenderDrawColor(r, 255, 255, 0, 255);
+        SDL_RenderDrawRect(r, &rc);
     }
     bool is_alive() const { return alive; }
     void die()           { alive = false; }
     Vector2 get_pos()    const { return pos; }
     SDL_Rect get_rect()  const { return { (int)(pos.x-w/2), (int)(pos.y-h/2), w, h }; }
+    void set_texture(SDL_Texture* t) { tex = t; }
+    void set_angle(float a) { angle = a; }
 };
 
 class Particle : public Entity {
@@ -471,7 +490,7 @@ class Player : public Entity {
     int shoot_cd = 0;
     float speed = 6.f;
 public:
-    Player() : Entity({WIDTH/2.f, HEIGHT/2.f}, 28, 28, {240,240,255,255}) {}
+    Player() : Entity({WIDTH/2.f, HEIGHT/2.f}, 30, 30, {200, 220, 255, 255}) {}
     void update() override { if (shoot_cd > 0) shoot_cd--; }
     void move(Vector2 dir, bool restricted = false) {
         if (dir.length() > 0) {
@@ -510,7 +529,7 @@ class Enemy : public Entity {
     Vector2 vel_smooth;
 public:
     Enemy(Player* p, std::vector<Bullet*>& eb)
-        : Entity({0,0}, 26, 26, {255, 60, 60, 255}),
+        : Entity({0,0}, 30, 30, {255, 80, 80, 255}),
           player_ptr(p), bullets_ref(eb), min_dist(160.f)
     {
         // Spawn at edge
@@ -531,6 +550,9 @@ public:
         float   dist   = to_p.length();
         Vector2 dir    = to_p.normalize();
 
+        // Update angle to face player
+        angle = std::atan2(to_p.y, to_p.x) * 180.0f / 3.14159265f;
+
         if (dist > min_dist)           pos += dir * 2.2f;
         else if (dist < min_dist-20.f) pos -= dir * 1.1f;
 
@@ -546,7 +568,7 @@ public:
             float bspd = 5.2f;
             float t    = dist / bspd;
             Vector2 pred = player_ptr->get_pos() + player_ptr->get_vel() * t;
-            bullets_ref.push_back(new Bullet(pos, pred, {255,100,100,255}, 8, bspd));
+            bullets_ref.push_back(new Bullet(pos, pred, {255, 140, 80, 255}, 8, bspd));
             shoot_cd = RNG::rng_int(80, 160);
         }
     }
@@ -558,21 +580,19 @@ public:
 
 class Background {
     SDL_Texture* tex = nullptr;
-    int bw = 0, bh = 0;
-    float scroll = 0;
 public:
     Background(SDL_Renderer* r) {
-        tex = IMG_LoadTexture(r, "back.jpg");
-        if (tex) SDL_QueryTexture(tex, NULL, NULL, &bw, &bh);
+        tex = IMG_LoadTexture(r, "back.png");
+        if (tex) {
+            SDL_SetTextureColorMod(tex, 150, 150, 200);
+        }
     }
     ~Background() { if (tex) SDL_DestroyTexture(tex); }
-    void update() { scroll += 0.8f; if (scroll >= bw) scroll = 0; }
+    void update() {}
     void draw(SDL_Renderer* r, int ox, int oy) {
         if (!tex) return;
-        SDL_Rect r1 = {(int)-scroll+ox, oy, bw, HEIGHT};
-        SDL_Rect r2 = {(int)(bw-scroll)+ox, oy, bw, HEIGHT};
-        SDL_RenderCopy(r, tex, NULL, &r1);
-        SDL_RenderCopy(r, tex, NULL, &r2);
+        SDL_Rect dst = {ox, oy, WIDTH, HEIGHT};
+        SDL_RenderCopy(r, tex, NULL, &dst);
     }
 };
 
@@ -587,6 +607,9 @@ class Game {
     Player*     player = nullptr;
     PolicyNet*  net    = nullptr;
     Background* bg     = nullptr;
+
+    SDL_Texture* player_tex = nullptr;
+    SDL_Texture* enemy_tex  = nullptr;
 
     std::vector<Enemy*>    enemies;
     std::vector<Bullet*>   p_bullets, e_bullets;
@@ -628,7 +651,7 @@ public:
     bool init(bool ai) {
         ai_mode = ai;
         if (SDL_Init(SDL_INIT_VIDEO) < 0) { std::cerr << SDL_GetError() << "\n"; return false; }
-        if (!(IMG_Init(IMG_INIT_JPG) & IMG_INIT_JPG)) {}
+        if (!(IMG_Init(IMG_INIT_JPG | IMG_INIT_PNG) & (IMG_INIT_JPG | IMG_INIT_PNG))) {}
         if (TTF_Init() < 0) {}
 
         window   = SDL_CreateWindow("Spiral Shooter ── AI Enhanced",
@@ -648,7 +671,12 @@ public:
             if (font) break;
         }
 
+        player_tex = IMG_LoadTexture(renderer, "Player.png");
+        enemy_tex  = IMG_LoadTexture(renderer, "Enemy.png");
+
         player = new Player();
+        if (player_tex) player->set_texture(player_tex);
+
         net    = new PolicyNet();
         if (ai_mode) net->load("model.weights");
         bg = new Background(renderer);
@@ -779,6 +807,7 @@ private:
         enemies.clear(); p_bullets.clear(); e_bullets.clear(); particles.clear();
 
         delete player; player = new Player();
+        if (player_tex) player->set_texture(player_tex);
 
         // Print accuracy
         float acc = shots_fired > 0 ? 100.f * shots_hit / shots_fired : 0.f;
@@ -848,6 +877,7 @@ private:
 
         // ── Reward Calculation ──
         float reward = 0.03f + (step_count % 10000) * 0.00001f; // scaling survival bonus
+        if (step_count > 2000) reward += 0.05f; // Late survival bonus
         Vector2 p_pos = player->get_pos();
 
         // Soft center gravity (quadratic)
@@ -906,7 +936,7 @@ private:
 
         // Dodge trajectory reward & Panic Zone
         if (found_bullet && min_bd < 250.f) {
-            if (min_bd < 120.f) reward -= 0.5f; // Panic Zone
+            if (min_bd < 150.f) reward -= 0.7f; // Tightened Panic Zone
             if (min_bd > prev_min_b_dist) reward += 0.25f;
             Vector2 bdir  = near_bv.normalize();
             float   oncoming = -move_dir.normalize().dot(bdir);
@@ -918,11 +948,13 @@ private:
         if (found_enemy) {
             if (min_ed < 110.f) reward -= 0.12f;
             if (min_ed < 350.f) reward += 0.05f; // Engagement reward
+            reward += 0.5f * (1.0f / (1.0f + min_ed)); // Reward killing faster/proximity
         }
 
         // Accuracy reward
         float acc = shots_fired > 0 ? (float)shots_hit / shots_fired : 0.f;
         reward += acc * 0.5f;
+        if (shots_fired > 50) reward += acc * 0.3f; // Protect accuracy
 
         // ── Shoot ──
         if (act[SHOOT_PROB] > 0.5f && player->can_shoot()) {
@@ -952,6 +984,10 @@ private:
                     // Aim quality reward
                     Vector2 to_e  = (near_ep - p_pos).normalize();
                     float   aq    = aim_dir.dot(to_e);
+
+                    // Update player angle to face aim direction
+                    player->set_angle(std::atan2(aim_dir.y, aim_dir.x) * 180.0f / 3.14159265f);
+
 if (aq > 0.95f)      reward += 2.5f;
 else if (aq > 0.85f) reward += 1.2f;
 else if (aq > 0.7f)  reward += 0.3f;
@@ -960,7 +996,7 @@ else                 reward -= 0.8f;
                     if (min_ed > 500.f) reward -= 0.3f;
 
                     Vector2 fire_target = p_pos + aim_dir * 1200.f;
-                    p_bullets.push_back(new Bullet(p_pos, fire_target, {120,220,80,255}, 10, b_speed));
+                    p_bullets.push_back(new Bullet(p_pos, fire_target, {120, 255, 120, 255}, 10, b_speed));
                     player->fire();
                     shots_fired++;
                 } else {
@@ -969,13 +1005,30 @@ else                 reward -= 0.8f;
                         aim_dir = (near_ep - p_pos).normalize();
                     else
                         aim_dir = aim_dir.normalize();
+
+                    // Update player angle to face aim direction
+                    player->set_angle(std::atan2(aim_dir.y, aim_dir.x) * 180.0f / 3.14159265f);
+
                     Vector2 fire_target = p_pos + aim_dir * 1200.f;
-                    p_bullets.push_back(new Bullet(p_pos, fire_target, {120,220,80,255}, 10, b_speed));
+                    p_bullets.push_back(new Bullet(p_pos, fire_target, {120, 255, 120, 255}, 10, b_speed));
                     player->fire();
                     shots_fired++;
                 }
             } else {
                 reward -= 0.35f; // shooting with no target
+            }
+        } else {
+            // Even if not shooting, update player rotation to face aim or nearest enemy
+            Vector2 aim_dir = {act[AIM_X], act[AIM_Y]};
+            if (ai_mode) {
+                if (found_enemy) {
+                    Vector2 pred_target = predict_aim(p_pos, near_ep, near_ev, 10.f);
+                    Vector2 pred_dir    = (pred_target - p_pos).normalize();
+                    player->set_angle(std::atan2(pred_dir.y, pred_dir.x) * 180.0f / 3.14159265f);
+                }
+            } else {
+                if (aim_dir.length() > 0.1f)
+                    player->set_angle(std::atan2(aim_dir.y, aim_dir.x) * 180.0f / 3.14159265f);
             }
         }
 
@@ -1009,7 +1062,9 @@ else                 reward -= 0.8f;
         int max_enemies = std::min(8, 2 + score/500);
         int spawn_interval = std::max(20, 80 - score/300);
         if (++spawn_timer >= spawn_interval && (int)enemies.size() < max_enemies) {
-            enemies.push_back(new Enemy(player, e_bullets));
+            Enemy* e = new Enemy(player, e_bullets);
+            if (enemy_tex) e->set_texture(enemy_tex);
+            enemies.push_back(e);
             spawn_timer = 0;
         }
     }
@@ -1071,7 +1126,7 @@ else                 reward -= 0.8f;
             if (SDL_HasIntersection(&br, &pr)) {
                 player->take_damage(40);
                 reward   -= 2.5f;
-                shake     = 12;
+                shake     = 16; // Stronger shake
                 delete *bit; bit = e_bullets.erase(bit);
                 if (player->get_health() <= 0) {
                     reward -= 5.f;
@@ -1147,12 +1202,17 @@ else                 reward -= 0.8f;
         if (!font) return;
         char buf[128];
         float acc = shots_fired > 0 ? 100.f * shots_hit / shots_fired : 0.f;
-        sprintf(buf, "HP: %d",        player->get_health()); render_text(buf, 12, 12,  {240,240,255,255});
-        sprintf(buf, "Score: %d",     score);                render_text(buf, 12, 40,  {240,240,255,255});
-        sprintf(buf, "Reward: %.1f",  total_reward);         render_text(buf, 12, 68,  {180,240,180,255});
-        sprintf(buf, "Acc: %.1f%%",   acc);                  render_text(buf, 12, 96,  {255,220,80,255});
-        sprintf(buf, "Eps: %.3f",     epsilon);              render_text(buf, 12, 124, {160,200,255,255});
-        sprintf(buf, "Buf: %d",       replay.size());        render_text(buf, 12, 152, {160,200,255,255});
+        
+        SDL_Color hp_color = {200, 255, 200, 255};
+        if (player->get_health() < 30) hp_color = {255, 80, 80, 255};
+        else if (player->get_health() < 60) hp_color = {255, 255, 100, 255};
+
+        sprintf(buf, "HP: %d",        player->get_health()); render_text(buf, 12, 12,  hp_color);
+        sprintf(buf, "Score: %d",     score);                render_text(buf, 12, 40,  {120, 200, 255, 255});
+        sprintf(buf, "Reward: %.1f",  total_reward);         render_text(buf, 12, 68,  {180, 240, 180, 255});
+        sprintf(buf, "Acc: %.1f%%",   acc);                  render_text(buf, 12, 96,  {255, 220, 80, 255});
+        sprintf(buf, "Eps: %.3f",     epsilon);              render_text(buf, 12, 124, {160, 200, 255, 255});
+        sprintf(buf, "Buf: %d",       replay.size());        render_text(buf, 12, 152, {160, 200, 255, 255});
         if (!ai_mode) render_text("HUMAN MODE", WIDTH-160, 12, {255,200,80,255});
         else          render_text("AI MODE",    WIDTH-130, 12, {80,220,255,255});
     }
@@ -1160,6 +1220,8 @@ else                 reward -= 0.8f;
     void cleanup() {
         if (net) net->save("model.weights");
         delete player; delete net; delete bg;
+        if (player_tex) SDL_DestroyTexture(player_tex);
+        if (enemy_tex)  SDL_DestroyTexture(enemy_tex);
         for (auto* e : enemies)   delete e;
         for (auto* b : p_bullets) delete b;
         for (auto* b : e_bullets) delete b;
