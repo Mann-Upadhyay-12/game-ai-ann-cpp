@@ -157,7 +157,7 @@ static void adam_update(Mat& W, Vec& b,
 //   Hidden : 128 → 128 → 64  (LeakyReLU + LayerNorm)
 //   Output : NUM_ACTIONS      (tanh for 0-3, sigmoid for 4)
 // ─────────────────────────────────────────────
-static constexpr int STATE_DIM  = 16; // expanded state
+static constexpr int STATE_DIM  = 20; // expanded state
 static constexpr int H1 = 128, H2 = 128, H3 = 64;
 
 struct PolicyNet {
@@ -700,9 +700,11 @@ private:
     // ── State Vector (16 features) ──────────────
     Vec get_state() const {
         Vec s;
+        Vector2 p_pos = player->get_pos();
+
         // Player position (normalised)
-        s.push_back(player->get_pos().x / WIDTH);
-        s.push_back(player->get_pos().y / HEIGHT);
+        s.push_back(p_pos.x / WIDTH);
+        s.push_back(p_pos.y / HEIGHT);
         // Player velocity
         s.push_back(player->get_vel().x / 8.f);
         s.push_back(player->get_vel().y / 8.f);
@@ -715,12 +717,12 @@ private:
 
         for (auto* e : enemies) {
             if (!is_visible(e->get_pos())) continue;
-            float d = player->get_pos().distance_to(e->get_pos());
+            float d = p_pos.distance_to(e->get_pos());
             if (d < min_ed) { min_ed = d; near_e = e->get_pos(); near_ep = e; found_enemy = true; }
         }
 
         if (found_enemy) {
-            Vector2 e_rel_dir = (near_e - player->get_pos()).normalize();
+            Vector2 e_rel_dir = (near_e - p_pos).normalize();
             s.push_back(e_rel_dir.x);
             s.push_back(e_rel_dir.y);
             s.push_back(std::min(1.f, min_ed / 900.f));   // normalised distance
@@ -739,15 +741,24 @@ private:
         Vector2 near_b = {0,0};
         Vector2 near_bv= {0,0};
         bool found_bullet = false;
+        int nearby_bullets = 0;
+        Vector2 escape = {0,0};
 
         for (auto* b : e_bullets) {
             if (!is_visible(b->get_pos())) continue;
-            float d = player->get_pos().distance_to(b->get_pos());
+            float d = p_pos.distance_to(b->get_pos());
+            
+            if (d < 200.f) {
+                nearby_bullets++;
+                Vector2 away = (p_pos - b->get_pos());
+                escape += away.normalize() / (d + 1.f);
+            }
+
             if (d < min_bd) { min_bd = d; near_b = b->get_pos(); near_bv = b->get_vel(); found_bullet = true; }
         }
 
         if (found_bullet) {
-            Vector2 b_dir = (near_b - player->get_pos()).normalize();
+            Vector2 b_dir = (near_b - p_pos).normalize();
             s.push_back(b_dir.x);
             s.push_back(b_dir.y);
             s.push_back(std::min(1.f, min_bd / 500.f));
@@ -766,6 +777,24 @@ private:
 
         // Player health
         s.push_back(player->get_health() / 100.f);
+
+        // --- ENHANCED VISION (v2) ---
+        // 17. Bullet density
+        s.push_back(std::min(1.f, nearby_bullets / 10.f));
+
+        // 18, 19. Escape direction hint
+        escape = escape.normalize();
+        s.push_back(escape.x);
+        s.push_back(escape.y);
+
+        // 20. Wall distance
+        float wall_dist = std::min({
+            p_pos.x,
+            WIDTH - p_pos.x,
+            p_pos.y,
+            HEIGHT - p_pos.y
+        }) / 300.f;
+        s.push_back(std::min(1.f, wall_dist));
 
         assert((int)s.size() == STATE_DIM);
         return s;
@@ -917,7 +946,7 @@ private:
         }
 
         // Multi-bullet awareness
-        reward -= nearby_bullets * 0.05f;
+        reward -= nearby_bullets * 0.02f; // Softened bullet density penalty
 
         // Smart movement reward
         float move_mag = move_dir.length();
@@ -928,7 +957,7 @@ private:
             if (found_bullet && min_bd < 250.f) {
                 Vector2 away = (p_pos - near_bp).normalize();
                 float smart_move = move_dir.normalize().dot(away);
-                reward += smart_move * 0.4f; // buffed dodge reward
+                reward += smart_move * 0.4f; // Keep strong dodge signal
             } else {
                 reward += 0.05f; // moving = good
             }
@@ -936,7 +965,7 @@ private:
 
         // Dodge trajectory reward & Panic Zone
         if (found_bullet && min_bd < 250.f) {
-            if (min_bd < 150.f) reward -= 0.7f; // Tightened Panic Zone
+            if (min_bd < 150.f) reward -= 0.25f; // Softened Panic Zone
             if (min_bd > prev_min_b_dist) reward += 0.25f;
             Vector2 bdir  = near_bv.normalize();
             float   oncoming = -move_dir.normalize().dot(bdir);
@@ -959,9 +988,6 @@ private:
         // ── Shoot ──
         if (act[SHOOT_PROB] > 0.5f && player->can_shoot()) {
             if (found_enemy) {
-                // Survival vs Shooting priority
-                if (found_bullet && min_bd < 180.f) reward -= 0.3f; // prioritize survival
-
                 // Softened encouragement
                 if (step_count < 20000) reward += 0.08f;
                 reward -= 0.1f; // Ammo cost
@@ -978,7 +1004,7 @@ private:
                     // if (aim_dir.length() > 0.1f) {
                     //     aim_dir = (aim_dir.normalize() * 0.6f + pred_dir * 0.4f).normalize();
                     // } else {
-                        aim_dir = pred_dir;
+                        aim_dir = {act[AIM_X], act[AIM_Y]};
                     // }
 
                     // Aim quality reward
@@ -1112,7 +1138,6 @@ else                 reward -= 0.8f;
         for (auto bit = p_bullets.begin(); bit != p_bullets.end();) {
             (*bit)->update();
             if (!(*bit)->is_alive()) { 
-                reward -= 0.6f; // penalty for bullet dying without a hit
                 delete *bit; 
                 bit = p_bullets.erase(bit); 
             }
