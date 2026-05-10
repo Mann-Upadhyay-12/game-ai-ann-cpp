@@ -16,3 +16,8 @@
     - Gradually increase difficulty (spawn rate, enemy speed, etc.).
 - [x] **F. PPO Implementation**
     - Upgrade `PolicyNet` to support PPO (Importance sampling, Clipping).
+
+
+- [ ] Review the reward system
+    - Add higher bullet cost
+    - Try to fix rewards to make the AI dodge and also move around to look "alive" instead of just staying in corner and shooting like a turrent 
