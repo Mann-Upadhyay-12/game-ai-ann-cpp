@@ -95,4 +95,4 @@ Implementing RL from scratch in C++ provides a deep understanding of the underly
 
 ---
 
-*Unequivocally "GitHub Worthy" — demonstrating systems engineering and ML fundamentals.*
+# game-ai-ann-cpp
