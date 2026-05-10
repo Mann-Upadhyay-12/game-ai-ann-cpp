@@ -6,3 +6,6 @@ shooter_headless
 *.txt
 *.o
 .DS_Store
+*.png
+*.jpg
+*.jpeg

@@ -33,8 +33,6 @@ namespace game {
 
         int   train_every = 128;
         int   step_count  = 0;
-        int   zone_edge_timer = 0;
-        float prev_min_b_dist = 1e9f;
 
         int shots_fired = 0, shots_hit = 0;
 

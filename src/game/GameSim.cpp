@@ -77,7 +77,6 @@ namespace game {
 
         state_history.assign(constants::FRAME_STACK, Vec(constants::SINGLE_STATE_DIM, 0.f));
         score = 0; total_reward = 0; spawn_timer = 0;
-        prev_min_b_dist = 1e9f; zone_edge_timer = 0;
         shots_fired = shots_hit = 0;
         alive = true;
     }
@@ -133,30 +132,36 @@ namespace game {
             s.push_back(0.f); s.push_back(0.f);
         }
 
-        struct BulletInfo { float dist; Vector2 pos, vel; };
+        struct BulletInfo { float dist; Vector2 pos, vel; float threat; };
         std::vector<BulletInfo> found_bullets;
         for (auto* b : e_bullets) {
             if (!is_visible(b->get_pos())) continue;
             float d = player->get_pos().distance_to(b->get_pos());
-            found_bullets.push_back({d, b->get_pos(), b->get_vel()});
+            Vector2 to_p = (player->get_pos() - b->get_pos()).normalize();
+            Vector2 bvn  = b->get_vel().normalize();
+            float threat = bvn.dot(to_p);
+            found_bullets.push_back({d, b->get_pos(), b->get_vel(), threat});
         }
+        // Sort by threat first, then distance
         std::sort(found_bullets.begin(), found_bullets.end(), [](const BulletInfo& a, const BulletInfo& b) {
+            if (std::abs(a.threat - b.threat) > 0.1f) return a.threat > b.threat;
             return a.dist < b.dist;
         });
 
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < 4; i++) {
             if (i < (int)found_bullets.size()) {
-                Vector2 to_p = (player->get_pos() - found_bullets[i].pos).normalize();
-                Vector2 bvn  = found_bullets[i].vel.normalize();
-                float threat = bvn.dot(to_p);
-
                 Vector2 b_dir = (found_bullets[i].pos - player->get_pos()).normalize();
                 s.push_back(b_dir.x);
                 s.push_back(b_dir.y);
-                s.push_back(std::min(1.f, found_bullets[i].dist / 500.f));
+                
+                float b_speed = found_bullets[i].vel.length();
+                float tti = (b_speed > 0.01f) ? found_bullets[i].dist / b_speed : 999.f;
+                s.push_back(std::min(1.f, tti / 60.f)); // Normalized to ~1s at 60fps
+
+                Vector2 bvn = found_bullets[i].vel.normalize();
                 s.push_back(bvn.x);
                 s.push_back(bvn.y);
-                s.push_back(threat);
+                s.push_back(found_bullets[i].threat);
             } else {
                 s.push_back(0.f); s.push_back(0.f);
                 s.push_back(1.f);
@@ -236,11 +241,37 @@ namespace game {
             if (d < min_ed) { min_ed = d; near_ep = e->get_pos(); near_ev = e->get_vel_smooth(); found_enemy = true; }
         }
 
+        // --- Dodging Reward ---
+        float max_threat = 0.f;
+        Vector2 best_bvn = {0,0};
+        float dist_at_max_threat = 1e9f;
+        for (auto* b : e_bullets) {
+            if (!is_visible(b->get_pos())) continue;
+            float d = p_pos.distance_to(b->get_pos());
+            Vector2 to_p = (p_pos - b->get_pos()).normalize();
+            Vector2 bvn  = b->get_vel().normalize();
+            float threat = bvn.dot(to_p);
+            if (threat > max_threat) {
+                max_threat = threat;
+                best_bvn = bvn;
+                dist_at_max_threat = d;
+            }
+        }
+
         if (found_enemy) {
-            // Reward being in engagement range (100–350px), penalize camping far away
-            if (min_ed < 120.f)       reward -= 0.1f;  // too close, getting rammed
-            else if (min_ed < 350.f)  reward += 0.08f; // sweet spot
-            else                      reward -= 0.04f; // too far, camping
+            // Reward being in engagement range, but gate it: only when no immediate threat
+            if (max_threat < 0.5f) {
+                if (min_ed < 120.f)       reward -= 0.1f;
+                else if (min_ed < 350.f)  reward += 0.04f;
+                else                      reward -= 0.02f;
+            }
+        }
+
+        if (max_threat > 0.7f && move_idx != 8) {
+            // Reward moving perpendicular to the bullet's path
+            float dodge_quality = 1.0f - std::abs(move_dir.dot(best_bvn));
+            float urgency = 1.f - std::min(1.f, dist_at_max_threat / 250.f);
+            reward += 0.15f * dodge_quality * urgency * max_threat;
         }
 
         // Penalize hugging zone edges (corner camping)
@@ -269,7 +300,7 @@ namespace game {
         }
 
         bool died = update_entities(reward);
-        if (died) reward = -50.0f; // death penalty
+        if (died) reward -= 50.0f; // additive death penalty
 
         total_reward += reward;
         step_count++;

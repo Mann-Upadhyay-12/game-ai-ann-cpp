@@ -11,7 +11,7 @@ namespace constants {
     static constexpr int SHOOT_ACTIONS = 2; // yes/no
     static constexpr int NUM_ACTIONS = MOVE_ACTIONS + SHOOT_ACTIONS;
 
-    static constexpr int SINGLE_STATE_DIM = 23;
+    static constexpr int SINGLE_STATE_DIM = 35;
 
     static constexpr int FRAME_STACK = 4;
     static constexpr int STATE_DIM = SINGLE_STATE_DIM * FRAME_STACK;
