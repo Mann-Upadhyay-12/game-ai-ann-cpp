@@ -1,0 +1,8 @@
+cat_src.sh
+obj/
+shooter
+shooter_headless
+*.weights
+*.txt
+*.o
+.DS_Store
