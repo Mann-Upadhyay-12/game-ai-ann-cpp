@@ -18,6 +18,17 @@
     - Upgrade `PolicyNet` to support PPO (Importance sampling, Clipping).
 
 
-- [ ] Review the reward system
-    - Add higher bullet cost
-    - Try to fix rewards to make the AI dodge and also move around to look "alive" instead of just staying in corner and shooting like a turrent 
+- [x] **G. Advanced AI Architecture**
+    - [x] Relative State Representation (player-centric sensing).
+    - [x] Aim "Nudge" Output Head (+/- 15 degrees) for fine accuracy.
+    - [x] Generalized Advantage Estimation (GAE) for cleaner training.
+    - [x] Bullet Cost reward to penalize mindless spam.
+    - [x] Threat-gated engagement rewards.
+
+- [x] **H. Future Polishing**
+    - [x] Action Repeating (Smooth Movement).
+    - [x] Separate Advantage Heads (Survival vs Offense).
+    - [x] Dynamic Zone sizing (score-dependent).
+
+- [ ] **I. Improve Surivival**
+

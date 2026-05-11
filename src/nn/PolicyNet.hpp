@@ -25,10 +25,14 @@ namespace nn {
         Vec forward(const Vec& s, Cache* cache = nullptr) const;
         void train_ppo(const std::vector<Vec>& states,
                        const std::vector<Vec>& actions_taken,
-                       const std::vector<float>& returns,
+                       const std::vector<float>& rewards_s,
+                       const std::vector<float>& rewards_o,
+                       const std::vector<Vec>& next_states,
+                       const std::vector<bool>& dones,
                        const std::vector<float>& old_log_probs,
                        float clip_eps = 0.2f,
-                       int   ppo_epochs = 4);
+                       int ppo_epochs = 4);
+
 
         void save(const std::string& path, int steps, float eps, int episodes, float best) const;
         struct ModelData { int steps; float eps; int episodes; float best; };

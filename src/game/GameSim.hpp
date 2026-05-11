@@ -15,7 +15,7 @@ namespace game {
 
         struct StepData {
             Vec   state, action;
-            float reward;
+            float reward_survival, reward_offense;
             Vec   next_state;
             float log_prob;
             bool  done;
@@ -26,6 +26,13 @@ namespace game {
         float total_reward = 0.f;
         int   spawn_timer  = 0;
         bool  alive        = true;
+
+        float zone_size    = 350.f;
+
+        int   action_repeat = 4;
+        int   repeat_timer  = 0;
+        int   last_move_idx = 8, last_nudge_idx = 3, last_shoot_idx = 0;
+        float last_log_prob = 0.f;
 
         float epsilon      = 0.3f;
         static constexpr float EPS_MIN   = 0.08f;
@@ -57,6 +64,6 @@ namespace game {
         bool step();
 
     private:
-        bool update_entities(float& reward);
+        bool update_entities(float& r_s, float& r_o);
     };
 }

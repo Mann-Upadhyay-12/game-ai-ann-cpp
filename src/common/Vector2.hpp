@@ -4,6 +4,7 @@
 struct Vector2 {
     float x = 0, y = 0;
     Vector2(float x = 0, float y = 0) : x(x), y(y) {}
+    Vector2 operator-() const { return {-x, -y}; }
     Vector2 operator+(const Vector2& v) const { return {x+v.x, y+v.y}; }
     Vector2 operator-(const Vector2& v) const { return {x-v.x, y-v.y}; }
     Vector2 operator*(float s)          const { return {x*s,   y*s};   }

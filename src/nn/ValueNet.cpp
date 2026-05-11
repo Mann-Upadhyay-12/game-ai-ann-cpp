@@ -14,14 +14,14 @@ namespace nn {
         init_mat(vw1, vb1, VH1, constants::STATE_DIM);
         init_mat(vw2, vb2, VH2, VH1);
         init_mat(vw3, vb3, VH3, VH2);
-        init_mat(vw4, vb4, 1,   VH3);
+        init_mat(vw4, vb4, 2,   VH3);
         vas1 = AdamState(VH1, constants::STATE_DIM);
         vas2 = AdamState(VH2, VH1);
         vas3 = AdamState(VH3, VH2);
-        vas4 = AdamState(1,   VH3);
+        vas4 = AdamState(2,   VH3);
     }
 
-    float ValueNet::forward(const Vec& s, VCache* cache) const {
+    Vec ValueNet::forward(const Vec& s, VCache* cache) const {
         Vec pre1 = mat_vec_mul(vw1, s); add_bias(pre1, vb1);
         Vec h1   = leaky_relu(pre1);    layer_norm(h1);
         Vec pre2 = mat_vec_mul(vw2, h1); add_bias(pre2, vb2);
@@ -30,23 +30,27 @@ namespace nn {
         Vec h3   = leaky_relu(pre3);    layer_norm(h3);
         Vec out  = mat_vec_mul(vw4, h3); add_bias(out, vb4);
         if (cache) *cache = {h1, h2, h3, pre1, pre2, pre3};
-        return out[0];
+        return out;
     }
 
-    void ValueNet::train_step(const Vec& s, float target) {
+    void ValueNet::train_step(const Vec& s, const Vec& target) {
         VCache cache;
-        float pred = forward(s, &cache);
-        float err  = target - pred;
+        Vec pred = forward(s, &cache);
+        Vec dout(2);
+        for (int i = 0; i < 2; i++) dout[i] = target[i] - pred[i];
 
-        Vec dout = {err};
-        Mat dvw4 = make_mat(1, VH3);
-        Vec dvb4(1, 0.f);
+        Mat dvw4 = make_mat(2, VH3);
+        Vec dvb4(2, 0.f);
         Vec h3_err(VH3, 0.f);
         for (int i = 0; i < VH3; i++) {
-            dvw4[0][i] = dout[0] * cache.h3[i];
-            h3_err[i]  = vw4[0][i] * dout[0];
+            float e = 0;
+            for (int j = 0; j < 2; j++) {
+                dvw4[j][i] = dout[j] * cache.h3[i];
+                e         += vw4[j][i] * dout[j];
+            }
+            h3_err[i] = e;
         }
-        dvb4[0] = dout[0];
+        for (int j = 0; j < 2; j++) dvb4[j] = dout[j];
 
         Vec d3 = d_leaky_relu(cache.pre3);
         Mat dvw3 = make_mat(VH3, VH2);

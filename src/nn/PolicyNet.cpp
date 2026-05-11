@@ -39,7 +39,8 @@ namespace nn {
 
         // Discretized Heads (D)
         softmax(out, 0, constants::MOVE_ACTIONS);
-        softmax(out, constants::MOVE_ACTIONS, constants::SHOOT_ACTIONS);
+        softmax(out, constants::MOVE_ACTIONS, constants::NUDGE_ACTIONS);
+        softmax(out, constants::MOVE_ACTIONS + constants::NUDGE_ACTIONS, constants::SHOOT_ACTIONS);
 
         if (cache) *cache = {h1, h2, h3, pre1, pre2, pre3};
         return out;
@@ -47,7 +48,10 @@ namespace nn {
 
     void PolicyNet::train_ppo(const std::vector<Vec>& states,
                               const std::vector<Vec>& actions_taken,
-                              const std::vector<float>& returns,
+                              const std::vector<float>& rewards_s,
+                              const std::vector<float>& rewards_o,
+                              const std::vector<Vec>& next_states,
+                              const std::vector<bool>& dones,
                               const std::vector<float>& old_log_probs,
                               float clip_eps,
                               int ppo_epochs)
@@ -55,18 +59,39 @@ namespace nn {
         int N = (int)states.size();
         if (N == 0) return;
 
-        // Advantage calculation
-        std::vector<float> advantages(N);
+        // --- GAE Advantage Calculation ---
+        float gamma = 0.99f;
+        float lambda = 0.95f;
+        std::vector<Vec> values(N), next_values(N);
         for (int i = 0; i < N; i++) {
-            float V = critic.forward(states[i]);
-            advantages[i] = returns[i] - V;
-            critic.train_step(states[i], returns[i]);
+            values[i] = critic.forward(states[i]);
+            next_values[i] = dones[i] ? Vec{0.f, 0.f} : critic.forward(next_states[i]);
         }
 
-        float adv_mean = 0;
+        std::vector<float> advantages(N), adv_s(N), adv_o(N);
+        float last_gae_s = 0, last_gae_o = 0;
+        for (int i = N - 1; i >= 0; i--) {
+            if (dones[i]) { last_gae_s = 0; last_gae_o = 0; }
+            float delta_s = rewards_s[i] + gamma * next_values[i][0] - values[i][0];
+            float delta_o = rewards_o[i] + gamma * next_values[i][1] - values[i][1];
+            
+            adv_s[i] = last_gae_s = delta_s + gamma * lambda * last_gae_s;
+            adv_o[i] = last_gae_o = delta_o + gamma * lambda * last_gae_o;
+            
+            // Combine advantages: Survival is prioritized slightly for stability
+            advantages[i] = 0.6f * last_gae_s + 0.4f * last_gae_o;
+        }
+
+        // Train critic on returns: R = A + V
+        for (int i = 0; i < N; i++) {
+            Vec returns = { adv_s[i] + values[i][0], adv_o[i] + values[i][1] };
+            critic.train_step(states[i], returns);
+        }
+
+        // Normalize advantages
+        float adv_mean = 0, adv_std = 0;
         for (float a : advantages) adv_mean += a;
         adv_mean /= N;
-        float adv_std = 0;
         for (float a : advantages) adv_std += (a - adv_mean) * (a - adv_mean);
         adv_std = std::sqrt(adv_std / N + 1e-8f);
         for (float& a : advantages) a = (a - adv_mean) / adv_std;
@@ -80,16 +105,17 @@ namespace nn {
                 Cache cache;
                 Vec pred = forward(states[idx], &cache);
 
-                int move_a  = (int)actions_taken[idx][0];
-                int shoot_a = (int)actions_taken[idx][1];
+                int move_a   = (int)actions_taken[idx][0];
+                int nudge_a  = (int)actions_taken[idx][1];
+                int shoot_a  = (int)actions_taken[idx][2];
 
                 float cur_lp = std::log(pred[move_a] + 1e-9f) +
-                               std::log(pred[constants::MOVE_ACTIONS + shoot_a] + 1e-9f);
+                               std::log(pred[constants::MOVE_ACTIONS + nudge_a] + 1e-9f) +
+                               std::log(pred[constants::MOVE_ACTIONS + constants::NUDGE_ACTIONS + shoot_a] + 1e-9f);
 
                 float ratio = std::exp(cur_lp - old_log_probs[idx]);
                 float A = advantages[idx];
 
-                // Standard PPO Gradient scale: ratio * A (clipped)
                 float pg_scale = ratio * A;
                 if (A >= 0) {
                     if (ratio > 1.0f + clip_eps) pg_scale = 0.f;
@@ -99,18 +125,24 @@ namespace nn {
 
                 Vec out_err(constants::NUM_ACTIONS, 0.f);
                 auto add_head_loss = [&](int start, int count, int action_taken, float ent_coeff) {
+                    float entropy = 0.f;
+                    for (int i = 0; i < count; i++) {
+                        float p = pred[start + i];
+                        entropy -= p * std::log(p + 1e-9f);
+                    }
                     for (int i = 0; i < count; i++) {
                         float target = (i == action_taken) ? 1.f : 0.f;
-                        // Policy gradient
-                        out_err[start + i] += pg_scale * (target - pred[start + i]);
-                        // Entropy bonus: encourages exploration
                         float p = pred[start + i];
-                        out_err[start + i] += ent_coeff * p * (-std::log(p + 1e-9f));
+                        // Policy Gradient
+                        out_err[start + i] += pg_scale * (target - p);
+                        // Entropy Grad: -p(log p + H)
+                        out_err[start + i] += ent_coeff * (-p * (std::log(p + 1e-9f) + entropy));
                     }
                 };
 
                 add_head_loss(0, constants::MOVE_ACTIONS, move_a, 0.03f);
-                add_head_loss(constants::MOVE_ACTIONS, constants::SHOOT_ACTIONS, shoot_a, 0.05f);
+                add_head_loss(constants::MOVE_ACTIONS, constants::NUDGE_ACTIONS, nudge_a, 0.02f);
+                add_head_loss(constants::MOVE_ACTIONS + constants::NUDGE_ACTIONS, constants::SHOOT_ACTIONS, shoot_a, 0.05f);
 
                 Vec h3_err(H3, 0.f);
                 for (int i = 0; i < H3; i++) {

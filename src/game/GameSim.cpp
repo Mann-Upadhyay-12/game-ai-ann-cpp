@@ -5,6 +5,7 @@
 #include <fstream>
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 
 namespace game {
     GameSim::GameSim(nn::PolicyNet* n) : net(n) {
@@ -23,33 +24,29 @@ namespace game {
 
     void GameSim::finish_episode() {
         if (rollout.empty()) return;
-        float gamma = 0.99f;
-        float G = 0.f;
-        if (!rollout.back().done) {
-            G = net->critic.forward(rollout.back().next_state);
-        }
 
-        std::vector<Vec> states, actions;
-        std::vector<float> returns, log_probs;
+        std::vector<Vec> states, actions, next_states;
+        std::vector<float> rewards_s, rewards_o, log_probs;
+        std::vector<bool> dones;
         states.reserve(rollout.size());
         actions.reserve(rollout.size());
-        returns.reserve(rollout.size());
+        next_states.reserve(rollout.size());
+        rewards_s.reserve(rollout.size());
+        rewards_o.reserve(rollout.size());
         log_probs.reserve(rollout.size());
+        dones.reserve(rollout.size());
 
-        for (int i = (int)rollout.size()-1; i >= 0; i--) {
-            G = rollout[i].reward + gamma * G;
-            states.push_back(rollout[i].state);
-            actions.push_back(rollout[i].action);
-            returns.push_back(G);
-            log_probs.push_back(rollout[i].log_prob);
+        for (auto& step : rollout) {
+            states.push_back(step.state);
+            actions.push_back(step.action);
+            next_states.push_back(step.next_state);
+            rewards_s.push_back(step.reward_survival);
+            rewards_o.push_back(step.reward_offense);
+            log_probs.push_back(step.log_prob);
+            dones.push_back(step.done);
         }
         
-        std::reverse(states.begin(), states.end());
-        std::reverse(actions.begin(), actions.end());
-        std::reverse(returns.begin(), returns.end());
-        std::reverse(log_probs.begin(), log_probs.end());
-
-        net->train_ppo(states, actions, returns, log_probs);
+        net->train_ppo(states, actions, rewards_s, rewards_o, next_states, dones, log_probs);
         rollout.clear();
     }
 
@@ -104,45 +101,45 @@ namespace game {
 
     Vec GameSim::get_single_state() const {
         Vec s;
-        s.push_back(player->get_pos().x / constants::WIDTH);
-        s.push_back(player->get_pos().y / constants::HEIGHT);
+        Vector2 p_pos = player->get_pos();
+        // 1. Player relative position (to center) and absolute velocity
+        s.push_back((p_pos.x - constants::WIDTH/2) / (constants::WIDTH/2));
+        s.push_back((p_pos.y - constants::HEIGHT/2) / (constants::HEIGHT/2));
         s.push_back(player->get_vel().x / 8.f);
         s.push_back(player->get_vel().y / 8.f);
 
+        // 2. Nearest Enemy (Relative)
         float   min_ed = 1e9f;
-        Vector2 near_e = {(float)constants::WIDTH/2, (float)constants::HEIGHT/2};
-        LogicEnemy* near_ep = nullptr;
+        Vector2 near_ep = {0,0}, near_ev = {0,0};
         bool found_enemy = false;
         for (auto* e : enemies) {
             if (!is_visible(e->get_pos())) continue;
-            float d = player->get_pos().distance_to(e->get_pos());
-            if (d < min_ed) { min_ed = d; near_e = e->get_pos(); near_ep = e; found_enemy = true; }
+            float d = p_pos.distance_to(e->get_pos());
+            if (d < min_ed) { min_ed = d; near_ep = e->get_pos(); near_ev = e->get_vel_smooth(); found_enemy = true; }
         }
         if (found_enemy) {
-            Vector2 e_rel = (near_e - player->get_pos()).normalize();
+            Vector2 e_rel = (near_ep - p_pos) / 500.f; // scaled relative pos
             s.push_back(e_rel.x);
             s.push_back(e_rel.y);
             s.push_back(std::min(1.f, min_ed / 900.f));
-            Vector2 ev = near_ep->get_vel_smooth();
-            s.push_back(ev.x / 5.f);
-            s.push_back(ev.y / 5.f);
+            s.push_back(near_ev.x / 5.f);
+            s.push_back(near_ev.y / 5.f);
         } else {
-            s.push_back(0.f); s.push_back(0.f);
-            s.push_back(1.f);
-            s.push_back(0.f); s.push_back(0.f);
+            s.push_back(0.f); s.push_back(0.f); s.push_back(1.f); s.push_back(0.f); s.push_back(0.f);
         }
 
-        struct BulletInfo { float dist; Vector2 pos, vel; float threat; };
+        // 3. Most Threatening Bullets (Relative)
+        struct BulletInfo { float dist; Vector2 rel_pos, vel; float threat; };
         std::vector<BulletInfo> found_bullets;
         for (auto* b : e_bullets) {
             if (!is_visible(b->get_pos())) continue;
-            float d = player->get_pos().distance_to(b->get_pos());
-            Vector2 to_p = (player->get_pos() - b->get_pos()).normalize();
+            float d = p_pos.distance_to(b->get_pos());
+            Vector2 rel_p = b->get_pos() - p_pos;
+            Vector2 to_p = (-rel_p).normalize();
             Vector2 bvn  = b->get_vel().normalize();
             float threat = bvn.dot(to_p);
-            found_bullets.push_back({d, b->get_pos(), b->get_vel(), threat});
+            found_bullets.push_back({d, rel_p, b->get_vel(), threat});
         }
-        // Sort by threat first, then distance
         std::sort(found_bullets.begin(), found_bullets.end(), [](const BulletInfo& a, const BulletInfo& b) {
             if (std::abs(a.threat - b.threat) > 0.1f) return a.threat > b.threat;
             return a.dist < b.dist;
@@ -150,23 +147,21 @@ namespace game {
 
         for (int i = 0; i < 4; i++) {
             if (i < (int)found_bullets.size()) {
-                Vector2 b_dir = (found_bullets[i].pos - player->get_pos()).normalize();
-                s.push_back(b_dir.x);
-                s.push_back(b_dir.y);
+                Vector2 rel_n = found_bullets[i].rel_pos / 500.f;
+                s.push_back(rel_n.x);
+                s.push_back(rel_n.y);
                 
                 float b_speed = found_bullets[i].vel.length();
                 float tti = (b_speed > 0.01f) ? found_bullets[i].dist / b_speed : 999.f;
-                s.push_back(std::min(1.f, tti / 60.f)); // Normalized to ~1s at 60fps
+                s.push_back(std::min(1.f, tti / 60.f));
 
                 Vector2 bvn = found_bullets[i].vel.normalize();
                 s.push_back(bvn.x);
                 s.push_back(bvn.y);
                 s.push_back(found_bullets[i].threat);
             } else {
-                s.push_back(0.f); s.push_back(0.f);
-                s.push_back(1.f);
-                s.push_back(0.f); s.push_back(0.f);
-                s.push_back(-1.f);
+                s.push_back(0.f); s.push_back(0.f); s.push_back(1.f);
+                s.push_back(0.f); s.push_back(0.f); s.push_back(-1.f);
             }
         }
 
@@ -208,11 +203,31 @@ namespace game {
         state_history.push_back(single);
 
         Vec state = get_state();
-        Vec probs = net->forward(state);
+        int move_idx, nudge_idx, shoot_idx;
+        float log_prob;
 
-        // Discrete Action Sampling - Use categorical for training
-        int move_idx  = RNG::categorical(probs, 0, constants::MOVE_ACTIONS);
-        int shoot_idx = RNG::categorical(probs, constants::MOVE_ACTIONS, constants::SHOOT_ACTIONS);
+        if (repeat_timer <= 0) {
+            Vec probs = net->forward(state);
+            move_idx  = RNG::categorical(probs, 0, constants::MOVE_ACTIONS);
+            nudge_idx = RNG::categorical(probs, constants::MOVE_ACTIONS, constants::NUDGE_ACTIONS);
+            shoot_idx = RNG::categorical(probs, constants::MOVE_ACTIONS + constants::NUDGE_ACTIONS, constants::SHOOT_ACTIONS);
+
+            log_prob = std::log(probs[move_idx] + 1e-9f) +
+                       std::log(probs[constants::MOVE_ACTIONS + nudge_idx] + 1e-9f) +
+                       std::log(probs[constants::MOVE_ACTIONS + constants::NUDGE_ACTIONS + shoot_idx] + 1e-9f);
+
+            last_move_idx  = move_idx;
+            last_nudge_idx = nudge_idx;
+            last_shoot_idx = shoot_idx;
+            last_log_prob  = log_prob;
+            repeat_timer   = action_repeat;
+        } else {
+            move_idx  = last_move_idx;
+            nudge_idx = last_nudge_idx;
+            shoot_idx = last_shoot_idx;
+            log_prob  = last_log_prob;
+            repeat_timer--;
+        }
 
         // Interpretation
         static const Vector2 dirs[] = {
@@ -222,24 +237,11 @@ namespace game {
         Vector2 move_dir = dirs[move_idx];
         player->move(move_dir, true);
 
-        float reward = 0.f; // Drop survival reward — it's teaching passivity
+        float reward_s = 0.1f, reward_o = 0.f; // Base survival reward per step
         Vector2 p_pos = player->get_pos();
 
         // --- Movement rewards ---
-        // Penalize staying still
-        if (move_idx == 8) {
-            reward -= 0.05f;
-        }
-
-        // Reward closing distance to nearest enemy (approach bonus)
-        float   min_ed = 1e9f;
-        Vector2 near_ep = {0,0}, near_ev = {0,0};
-        bool    found_enemy = false;
-        for (auto* e : enemies) {
-            if (!is_visible(e->get_pos())) continue;
-            float d = p_pos.distance_to(e->get_pos());
-            if (d < min_ed) { min_ed = d; near_ep = e->get_pos(); near_ev = e->get_vel_smooth(); found_enemy = true; }
-        }
+        if (move_idx == 8) reward_s -= 0.05f;
 
         // --- Dodging Reward ---
         float max_threat = 0.f;
@@ -258,31 +260,36 @@ namespace game {
             }
         }
 
+        float   min_ed = 1e9f;
+        Vector2 near_ep = {0,0}, near_ev = {0,0};
+        bool    found_enemy = false;
+        for (auto* e : enemies) {
+            if (!is_visible(e->get_pos())) continue;
+            float d = p_pos.distance_to(e->get_pos());
+            if (d < min_ed) { min_ed = d; near_ep = e->get_pos(); near_ev = e->get_vel_smooth(); found_enemy = true; }
+        }
+
         if (found_enemy) {
-            // Reward being in engagement range, but gate it: only when no immediate threat
             if (max_threat < 0.5f) {
-                if (min_ed < 120.f)       reward -= 0.1f;
-                else if (min_ed < 350.f)  reward += 0.04f;
-                else                      reward -= 0.02f;
+                if (min_ed < 120.f)       reward_s -= 0.1f;
+                else if (min_ed < 350.f)  reward_s += 0.04f;
+                else                      reward_s -= 0.02f;
             }
         }
 
         if (max_threat > 0.7f && move_idx != 8) {
-            // Reward moving perpendicular to the bullet's path
             float dodge_quality = 1.0f - std::abs(move_dir.dot(best_bvn));
             float urgency = 1.f - std::min(1.f, dist_at_max_threat / 250.f);
-            reward += 0.15f * dodge_quality * urgency * max_threat;
+            reward_s += 0.15f * dodge_quality * urgency * max_threat;
         }
 
-        // Penalize hugging zone edges (corner camping)
+        // --- Dynamic Zone sizing ---
+        zone_size = std::max(150.f, 350.f - score / 20.f);
         int cx = constants::WIDTH/2, cy = constants::HEIGHT/2;
-        float edge_dist = std::min({
-            std::abs(p_pos.x - (cx - 300.f)),
-            std::abs(p_pos.x - (cx + 300.f)),
-            std::abs(p_pos.y - (cy - 300.f)),
-            std::abs(p_pos.y - (cy + 300.f))
-        });
-        if (edge_dist < 40.f) reward -= 0.08f;
+        float dx = std::abs(p_pos.x - cx), dy = std::abs(p_pos.y - cy);
+        if (dx > zone_size || dy > zone_size) {
+            reward_s -= 0.1f; // Out of zone penalty
+        }
 
         epsilon = std::max(EPS_MIN, epsilon * EPS_DECAY);
 
@@ -291,39 +298,48 @@ namespace game {
                 float   b_speed  = 10.f;
                 Vector2 pred_pos = predict_aim(p_pos, near_ep, near_ev, b_speed);
                 Vector2 fire_dir = (pred_pos - p_pos).normalize();
-                Vector2 fire_target = p_pos + fire_dir * 1200.f;
+
+                float nudge_deg = (nudge_idx - 3) * 5.0f; 
+                float nudge_rad = nudge_deg * (3.14159f / 180.f);
+                float cs = std::cos(nudge_rad), sn = std::sin(nudge_rad);
+                Vector2 nudged_dir = { fire_dir.x * cs - fire_dir.y * sn,
+                                       fire_dir.x * sn + fire_dir.y * cs };
+
+                Vector2 fire_target = p_pos + nudged_dir * 1200.f;
                 p_bullets.push_back(new LogicBullet(p_pos, fire_target, 10, b_speed));
                 player->fire();
                 shots_fired++;
-                reward += 0.3f; // small bonus for attempting a shot at a real enemy
+                
+                // Reward Shaping (Offense)
+                reward_o -= 0.1f; // Bullet cost
+                // Trust-predictor bonus: reward for small nudges
+                reward_o += 0.05f * (1.0f - std::abs(nudge_deg) / 15.0f);
+                // Engagement bonus: reward for just shooting at an enemy to encourage discovery
+                reward_o += 0.02f; 
             }
         }
 
-        bool died = update_entities(reward);
-        if (died) reward -= 50.0f; // additive death penalty
+        bool died = update_entities(reward_s, reward_o);
+        if (died) reward_s -= 50.0f;
 
-        total_reward += reward;
+        total_reward += (reward_s + reward_o);
         step_count++;
 
         Vec next_state = get_state();
-        Vec act_indices = {(float)move_idx, (float)shoot_idx};
+        Vec act_indices = {(float)move_idx, (float)nudge_idx, (float)shoot_idx};
         
-        float lp = std::log(probs[move_idx] + 1e-9f) +
-                   std::log(probs[constants::MOVE_ACTIONS + shoot_idx] + 1e-9f);
-
-        rollout.push_back({state, act_indices, reward, next_state, lp, died});
+        rollout.push_back({state, act_indices, reward_s, reward_o, next_state, log_prob, died});
 
         if ((int)rollout.size() >= train_every || died) {
             finish_episode();
         }
 
-        // --- Curriculum Learning (E) ---
-        // difficulty scales from 0.0 to 1.0 over 1M steps
+        // --- Curriculum Learning ---
         float difficulty = std::min(1.0f, (float)step_count / 1000000.f);
-        int base_max_enemies = 1 + (int)(difficulty * 3); // 1 to 4 base
+        int base_max_enemies = 1 + (int)(difficulty * 3);
         int max_enemies    = std::min(8, base_max_enemies + score/500);
         
-        int base_spawn_interval = 120 - (int)(difficulty * 60); // 120 to 60 base
+        int base_spawn_interval = 120 - (int)(difficulty * 60);
         int spawn_interval = std::max(20, base_spawn_interval - score/300);
 
         if (++spawn_timer >= spawn_interval && (int)enemies.size() < max_enemies) {
@@ -335,7 +351,7 @@ namespace game {
         return true;
     }
 
-    bool GameSim::update_entities(float& reward) {
+    bool GameSim::update_entities(float& r_s, float& r_o) {
         bool player_died = false;
         for (auto eit = enemies.begin(); eit != enemies.end();) {
             (*eit)->update(score);
@@ -345,12 +361,12 @@ namespace game {
                 Rect br = (*bit)->get_rect();
                 if (rects_intersect(er, br)) {
                     (*eit)->take_damage(50);
-                    reward    += 10.0f; // +10 hit
+                    r_o       += 10.0f; // +10 hit (Offense)
                     shots_hit += 1;
                     delete *bit; bit = p_bullets.erase(bit);
                     if (!(*eit)->is_alive() && !killed) {
                         score  += 100;
-                        reward += 50.0f; // +50 kill
+                        r_o    += 50.0f; // +50 kill (Offense)
                         killed  = true;
                     }
                 } else ++bit;
@@ -386,17 +402,3 @@ namespace game {
         return player_died;
     }
 }
-
-/*
-OLD REWARD LOGIC AND ROLLOUT (FOR REFERENCE):
-(Previously contained complex shaping rewards and conditional rollout training)
-
-    bool GameSim::step() {
-        ... (complex rewards removed) ...
-        if (died) reward = -20.0f;
-        ...
-        if ((int)rollout.size() >= train_every) {
-             // (Training logic using G_boot)
-        }
-    }
-*/

@@ -17,8 +17,8 @@ namespace nn {
 
         struct VCache { Vec h1, h2, h3, pre1, pre2, pre3; };
 
-        float forward(const Vec& s, VCache* cache = nullptr) const;
-        void train_step(const Vec& s, float target);
+        Vec forward(const Vec& s, VCache* cache = nullptr) const;
+        void train_step(const Vec& s, const Vec& target);
 
         void save(std::ofstream& f) const;
         void load(std::ifstream& f);

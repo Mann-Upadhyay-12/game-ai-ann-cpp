@@ -251,7 +251,7 @@ namespace rendering {
         if (!font) return;
         char buf[128];
         float acc = sim->shots_fired > 0 ? 100.f * sim->shots_hit / sim->shots_fired : 0.f;
-        float V   = sim->net->critic.forward(sim->get_state());
+        Vec V = sim->net->critic.forward(sim->get_state());
         SDL_Color hp_color = {200, 255, 200, 255};
         if      (sim->player->get_health() < 30) hp_color = {255, 80, 80, 255};
         else if (sim->player->get_health() < 60) hp_color = {255, 255, 100, 255};
@@ -259,10 +259,11 @@ namespace rendering {
         sprintf(buf, "Score: %d",       sim->score);                render_text(buf, 12, 40,  {120, 200, 255, 255});
         sprintf(buf, "Reward: %.1f",    sim->total_reward);         render_text(buf, 12, 68,  {180, 240, 180, 255});
         sprintf(buf, "Acc: %.1f%%",     acc);                       render_text(buf, 12, 96,  {255, 220, 80, 255});
-        sprintf(buf, "V(s): %.2f",      V);                         render_text(buf, 12, 124, {200, 200, 100, 255});
-        sprintf(buf, "Eps: %.4f",       sim->epsilon);              render_text(buf, 12, 152, {160, 200, 255, 255});
-        sprintf(buf, "Steps: %d",       sim->step_count);           render_text(buf, 12, 180, {160, 200, 255, 255});
-        sprintf(buf, "Best: %d",        (int)sim->best_score);      render_text(buf, 12, 208, {255, 200, 100, 255});
+        sprintf(buf, "V_surv: %.2f",    V[0]);                      render_text(buf, 12, 124, {200, 200, 100, 255});
+        sprintf(buf, "V_offn: %.2f",    V[1]);                      render_text(buf, 12, 152, {255, 150, 100, 255});
+        sprintf(buf, "Eps: %.4f",       sim->epsilon);              render_text(buf, 12, 180, {160, 200, 255, 255});
+        sprintf(buf, "Steps: %d",       sim->step_count);           render_text(buf, 12, 208, {160, 200, 255, 255});
+        sprintf(buf, "Best: %d",        (int)sim->best_score);      render_text(buf, 12, 236, {255, 200, 100, 255});
         if (!ai_mode) render_text("HUMAN MODE", constants::WIDTH-160, 12, {255, 200, 80, 255});
         else          render_text("A2C MODE",   constants::WIDTH-130, 12, {80, 220, 255, 255});
     }
